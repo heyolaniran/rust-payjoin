@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use bitcoincore_rpc::bitcoin::Amount;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Buf, Bytes, Incoming};
+use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -69,7 +69,7 @@ impl AppTrait for App {
         let (req, ctx) = SenderBuilder::new(psbt, uri.clone())
             .build_recommended(fee_rate)
             .with_context(|| "Failed to build payjoin request")?
-            .extract_v1();
+            .create_v1_post_request();
         let http = http_agent()?;
         let body = String::from_utf8(req.body.clone()).unwrap();
         println!("Sending fallback request to {}", &req.url);
@@ -88,12 +88,10 @@ impl AppTrait for App {
             "Sent fallback transaction hex: {:#}",
             payjoin::bitcoin::consensus::encode::serialize_hex(&fallback_tx)
         );
-        let psbt = ctx.process_response(&mut response.bytes().await?.to_vec().as_slice()).map_err(
-            |e| {
-                log::debug!("Error processing response: {e:?}");
-                anyhow!("Failed to process response {e}")
-            },
-        )?;
+        let psbt = ctx.process_response(&response.bytes().await?).map_err(|e| {
+            log::debug!("Error processing response: {e:?}");
+            anyhow!("Failed to process response {e}")
+        })?;
 
         self.process_pj_response(psbt)?;
         Ok(())
@@ -279,8 +277,8 @@ impl App {
         let (parts, body) = req.into_parts();
         let headers = Headers(&parts.headers);
         let query_string = parts.uri.query().unwrap_or("");
-        let body = body.collect().await.map_err(|e| Implementation(e.into()))?.aggregate().reader();
-        let proposal = UncheckedProposal::from_request(body, query_string, headers)?;
+        let body = body.collect().await.map_err(|e| Implementation(e.into()))?.to_bytes();
+        let proposal = UncheckedProposal::from_request(&body, query_string, headers)?;
 
         let payjoin_proposal = self.process_v1_proposal(proposal)?;
         let psbt = payjoin_proposal.psbt();
@@ -298,13 +296,13 @@ impl App {
     ) -> Result<PayjoinProposal, ReplyableError> {
         let wallet = self.wallet();
 
-        // in a payment processor where the sender could go offline, this is where you schedule to broadcast the original_tx
-        let _to_broadcast_in_failure_case = proposal.extract_tx_to_schedule_broadcast();
-
         // Receive Check 1: Can Broadcast
         let proposal =
             proposal.check_broadcast_suitability(None, |tx| Ok(wallet.can_broadcast(tx)?))?;
         log::trace!("check1");
+
+        // in a payment processor where the sender could go offline, this is where you schedule to broadcast the original_tx
+        let _to_broadcast_in_failure_case = proposal.extract_tx_to_schedule_broadcast();
 
         // Receive Check 2: receiver can't sign for proposal inputs
         let proposal = proposal.check_inputs_not_owned(|input| Ok(wallet.is_mine(input)?))?;
