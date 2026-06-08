@@ -9,15 +9,17 @@
 //! If you specifically need to use
 //! version 1, refer to the `receive::v1` module documentation after enabling the `v1` feature.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use bitcoin::transaction::InputWeightPrediction;
 use bitcoin::{
-    psbt, AddressType, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Weight,
+    psbt, AddressType, FeeRate, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Weight,
 };
 pub(crate) use error::InternalPayloadError;
 pub use error::{
-    Error, InputContributionError, JsonReply, OutputSubstitutionError, PayloadError,
-    ReplyableError, SelectionError,
+    CoinSelectionError, Error, InputContributionError, JsonReply, OutputSubstitutionError,
+    PayloadError, ProtocolError,
 };
 use optional_parameters::Params;
 use serde::{Deserialize, Serialize};
@@ -25,19 +27,23 @@ use serde::{Deserialize, Serialize};
 pub use crate::psbt::PsbtInputError;
 use crate::psbt::{
     InputWeightError, InternalInputPair, InternalPsbtInputError, PrevTxOutError, PsbtExt,
+    NON_WITNESS_INPUT_WEIGHT,
 };
-use crate::Version;
+use crate::{ImplementationError, Version};
 
+/// Input weight for a P2TR key-spend with default sighash (64-byte signature) and no annex.
+const DEFAULT_SIGHASH_KEY_SPEND_INPUT_WEIGHT: Weight = Weight::from_wu(
+    InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH.weight().to_wu()
+        + NON_WITNESS_INPUT_WEIGHT.to_wu(),
+);
+
+pub(crate) mod common;
 mod error;
 pub(crate) mod optional_parameters;
 
-#[cfg(feature = "_multiparty")]
-pub mod multiparty;
 #[cfg(feature = "v1")]
 #[cfg_attr(docsrs, doc(cfg(feature = "v1")))]
 pub mod v1;
-#[cfg(not(feature = "v1"))]
-pub(crate) mod v1;
 
 #[cfg(feature = "v2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "v2")))]
@@ -81,14 +87,11 @@ impl InputPair {
     fn new_legacy_input_pair(
         non_witness_utxo: Transaction,
         outpoint: OutPoint,
-        sequence: Option<Sequence>,
         redeem_script: Option<ScriptBuf>,
     ) -> Result<Self, PsbtInputError> {
         let txin = TxIn {
             previous_output: OutPoint { txid: outpoint.txid, vout: outpoint.vout },
-            script_sig: Default::default(),
-            sequence: sequence.unwrap_or_default(),
-            witness: Default::default(),
+            ..Default::default()
         };
 
         let psbtin = psbt::Input {
@@ -124,13 +127,12 @@ impl InputPair {
     pub fn new_p2pkh(
         non_witness_utxo: Transaction,
         outpoint: OutPoint,
-        sequence: Option<Sequence>,
     ) -> Result<Self, PsbtInputError> {
         let txout = Self::get_txout_for_outpoint(&non_witness_utxo, outpoint)?;
         if !txout.script_pubkey.is_p2pkh() {
             return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2pkh).into());
         }
-        Self::new_legacy_input_pair(non_witness_utxo, outpoint, sequence, None)
+        Self::new_legacy_input_pair(non_witness_utxo, outpoint, None)
     }
 
     /// Constructs a new [`InputPair`] for spending a legacy P2SH output.
@@ -138,27 +140,23 @@ impl InputPair {
         non_witness_utxo: Transaction,
         outpoint: OutPoint,
         redeem_script: ScriptBuf,
-        sequence: Option<Sequence>,
     ) -> Result<Self, PsbtInputError> {
         let txout = Self::get_txout_for_outpoint(&non_witness_utxo, outpoint)?;
         if !txout.script_pubkey.is_p2sh() {
             return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2sh).into());
         }
-        Self::new_legacy_input_pair(non_witness_utxo, outpoint, sequence, Some(redeem_script))
+        Self::new_legacy_input_pair(non_witness_utxo, outpoint, Some(redeem_script))
     }
 
     /// Helper function for creating SegWit input pairs
     fn new_segwit_input_pair(
         txout: TxOut,
         outpoint: OutPoint,
-        sequence: Option<Sequence>,
         expected_weight: Option<Weight>,
     ) -> Result<Self, PsbtInputError> {
         let txin = TxIn {
             previous_output: OutPoint { txid: outpoint.txid, vout: outpoint.vout },
-            script_sig: Default::default(),
-            sequence: sequence.unwrap_or_default(),
-            witness: Default::default(),
+            ..Default::default()
         };
 
         let psbtin = psbt::Input {
@@ -170,43 +168,52 @@ impl InputPair {
     }
 
     /// Constructs a new [`InputPair`] for spending a native SegWit P2WPKH output.
-    pub fn new_p2wpkh(
-        txout: TxOut,
-        outpoint: OutPoint,
-        sequence: Option<Sequence>,
-    ) -> Result<Self, PsbtInputError> {
+    pub fn new_p2wpkh(txout: TxOut, outpoint: OutPoint) -> Result<Self, PsbtInputError> {
         if !txout.script_pubkey.is_p2wpkh() {
             return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2wpkh).into());
         }
 
-        Self::new_segwit_input_pair(txout, outpoint, sequence, None)
+        Self::new_segwit_input_pair(txout, outpoint, None)
     }
 
     /// Constructs a new [`InputPair`] for spending a native SegWit P2WSH output.
     pub fn new_p2wsh(
         txout: TxOut,
         outpoint: OutPoint,
-        sequence: Option<Sequence>,
         expected_weight: Weight,
     ) -> Result<Self, PsbtInputError> {
         if !txout.script_pubkey.is_p2wsh() {
             return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2wsh).into());
         }
 
-        Self::new_segwit_input_pair(txout, outpoint, sequence, Some(expected_weight))
+        Self::new_segwit_input_pair(txout, outpoint, Some(expected_weight))
     }
 
-    /// Constructs a new [`InputPair`] for spending a native SegWit P2TR output.
-    pub fn new_p2tr(
+    /// Constructs a new [`InputPair`] for spending a native SegWit P2TR output
+    /// via the key spend path using the default taproot sighash (64-byte
+    /// signature) and no annex.
+    pub fn new_p2tr_keyspend(txout: TxOut, outpoint: OutPoint) -> Result<Self, PsbtInputError> {
+        if !txout.script_pubkey.is_p2tr() {
+            return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2tr).into());
+        }
+
+        Self::new_segwit_input_pair(txout, outpoint, Some(DEFAULT_SIGHASH_KEY_SPEND_INPUT_WEIGHT))
+    }
+
+    /// Constructs a new [`InputPair`] for spending a native SegWit P2TR output via the script path.
+    /// Callers must provide the expected input satisfiability weight. Ensure `expected_weight`
+    /// accurately reflects your script-path spend. Incorrect weight may cause fee calculation errors.
+    /// Use [`new_p2tr_keyspend`](Self::new_p2tr_keyspend) for key-path spends.
+    pub fn new_p2tr_scriptpath_spend(
         txout: TxOut,
         outpoint: OutPoint,
-        sequence: Option<Sequence>,
+        expected_weight: Weight,
     ) -> Result<Self, PsbtInputError> {
         if !txout.script_pubkey.is_p2tr() {
             return Err(InternalPsbtInputError::InvalidScriptPubKey(AddressType::P2tr).into());
         }
 
-        Self::new_segwit_input_pair(txout, outpoint, sequence, None)
+        Self::new_segwit_input_pair(txout, outpoint, Some(expected_weight))
     }
 
     pub(crate) fn previous_txout(&self) -> TxOut {
@@ -230,34 +237,284 @@ pub(crate) fn parse_payload(
     let unchecked_psbt = Psbt::from_str(base64).map_err(InternalPayloadError::ParsePsbt)?;
 
     let psbt = unchecked_psbt.validate().map_err(InternalPayloadError::InconsistentPsbt)?;
-    log::debug!("Received original psbt: {psbt:?}");
+    tracing::trace!("Received original psbt: {psbt:?}");
 
-    let pairs = url::form_urlencoded::parse(query.as_bytes());
-    let params = Params::from_query_pairs(pairs, supported_versions)
+    let params = Params::from_query_str(query, supported_versions)
         .map_err(InternalPayloadError::SenderParams)?;
-    log::debug!("Received request with params: {params:?}");
+    tracing::trace!("Received request with params: {params:?}");
 
     Ok((psbt, params))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PsbtContext {
+    original_psbt: Psbt,
+    payjoin_psbt: Psbt,
+}
+
+impl PsbtContext {
+    /// Prepare the PSBT by creating a new PSBT and copying only the fields allowed by the [spec](https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#senders-payjoin-proposal-checklist)
+    fn prepare_psbt(self, processed_psbt: Psbt) -> Psbt {
+        tracing::trace!("Original PSBT from callback: {processed_psbt:#?}");
+
+        // Create a new PSBT and copy only the allowed fields
+        let mut filtered_psbt = Psbt {
+            unsigned_tx: processed_psbt.unsigned_tx,
+            version: processed_psbt.version,
+            xpub: BTreeMap::new(),
+            proprietary: BTreeMap::new(),
+            unknown: BTreeMap::new(),
+            inputs: vec![],
+            outputs: vec![],
+        };
+
+        for input in &processed_psbt.inputs {
+            filtered_psbt.inputs.push(bitcoin::psbt::Input {
+                witness_utxo: input.witness_utxo.clone(),
+                non_witness_utxo: input.non_witness_utxo.clone(),
+                sighash_type: input.sighash_type,
+                final_script_sig: input.final_script_sig.clone(),
+                final_script_witness: input.final_script_witness.clone(),
+                tap_key_sig: input.tap_key_sig,
+                tap_script_sigs: input.tap_script_sigs.clone(),
+                tap_merkle_root: input.tap_merkle_root,
+                ..Default::default()
+            });
+        }
+
+        for _ in &processed_psbt.outputs {
+            filtered_psbt.outputs.push(bitcoin::psbt::Output::default());
+        }
+
+        tracing::trace!("Filtered PSBT: {filtered_psbt:#?}");
+
+        filtered_psbt
+    }
+
+    /// Return the indexes of the sender inputs.
+    fn sender_input_indexes(&self) -> Vec<usize> {
+        // iterate proposal as mutable WITH the outpoint (previous_output) available too
+        let mut original_inputs = self.original_psbt.input_pairs().peekable();
+        let mut sender_input_indexes = vec![];
+        for (i, input) in self.payjoin_psbt.input_pairs().enumerate() {
+            if let Some(original) = original_inputs.peek() {
+                tracing::trace!(
+                    "match previous_output: {} == {}",
+                    input.txin.previous_output,
+                    original.txin.previous_output
+                );
+                if input.txin.previous_output == original.txin.previous_output {
+                    sender_input_indexes.push(i);
+                    original_inputs.next();
+                }
+            }
+        }
+        sender_input_indexes
+    }
+
+    /// Returns payjoin proposal PSBT to be signed
+    ///
+    /// Removes all sender signatures which are received with the original PSBT
+    /// as these signatures are now invalid
+    fn psbt_to_sign(&self) -> Psbt {
+        let mut psbt = self.payjoin_psbt.clone();
+        // Remove now-invalid sender signatures before applying the receiver signatures
+        for i in self.sender_input_indexes() {
+            tracing::trace!("Clearing sender input {i}");
+            psbt.inputs[i].final_script_sig = None;
+            psbt.inputs[i].final_script_witness = None;
+            psbt.inputs[i].tap_key_sig = None;
+        }
+
+        psbt
+    }
+
+    /// Finalizes the Payjoin proposal into a PSBT which the sender will find acceptable before
+    /// they sign the transaction and broadcast it to the network.
+    ///
+    /// Finalization consists of signing and finalizing the PSBT using the passed `wallet_process_psbt` signing function.
+    fn finalize_proposal(
+        self,
+        wallet_process_psbt: impl Fn(&Psbt) -> Result<Psbt, ImplementationError>,
+    ) -> Result<Psbt, ImplementationError> {
+        let psbt = self.psbt_to_sign();
+        let signed_psbt = wallet_process_psbt(&psbt)?;
+        let expected_ntxid = self.payjoin_psbt.unsigned_tx.compute_ntxid();
+        let actual_ntxid = signed_psbt.unsigned_tx.compute_ntxid();
+        if expected_ntxid != actual_ntxid {
+            return Err(ImplementationError::from(
+                format!("Ntxid mismatch: expected {expected_ntxid}, got {actual_ntxid}").as_str(),
+            ));
+        }
+        let payjoin_proposal = self.prepare_psbt(signed_psbt);
+        Ok(payjoin_proposal)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OriginalPayload {
+    psbt: Psbt,
+    params: Params,
+}
+
+impl OriginalPayload {
+    // Calculates the fee rate of the original proposal PSBT.
+    fn psbt_fee_rate(&self) -> Result<FeeRate, InternalPayloadError> {
+        let original_psbt_fee = self.psbt.fee().map_err(|e| {
+            InternalPayloadError::ParsePsbt(bitcoin::psbt::PsbtParseError::PsbtEncoding(e))
+        })?;
+        Ok(original_psbt_fee / self.psbt.clone().extract_tx_unchecked_fee_rate().weight())
+    }
+
+    pub fn check_broadcast_suitability(
+        &self,
+        min_fee_rate: Option<FeeRate>,
+        can_broadcast: impl Fn(&bitcoin::Transaction) -> Result<bool, ImplementationError>,
+    ) -> Result<(), Error> {
+        let original_psbt_fee_rate = self.psbt_fee_rate()?;
+        if let Some(min_fee_rate) = min_fee_rate {
+            if original_psbt_fee_rate < min_fee_rate {
+                return Err(InternalPayloadError::PsbtBelowFeeRate(
+                    original_psbt_fee_rate,
+                    min_fee_rate,
+                )
+                .into());
+            }
+        }
+        if can_broadcast(&self.psbt.clone().extract_tx_unchecked_fee_rate())
+            .map_err(Error::Implementation)?
+        {
+            Ok(())
+        } else {
+            Err(InternalPayloadError::OriginalPsbtNotBroadcastable.into())
+        }
+    }
+
+    /// Check that the original PSBT has no receiver-owned inputs.
+    ///
+    /// An attacker can try to spend the receiver's own inputs. This check prevents that.
+    pub fn check_inputs_not_owned(
+        &self,
+        is_owned: &mut impl FnMut(&Script) -> Result<bool, ImplementationError>,
+    ) -> Result<(), Error> {
+        let mut err: Result<(), Error> = Ok(());
+        if let Some(e) = self
+            .psbt
+            .input_pairs()
+            .scan(&mut err, |err, input| match input.previous_txout() {
+                Ok(txout) => Some(txout.script_pubkey.to_owned()),
+                Err(e) => {
+                    **err = Err(InternalPayloadError::PrevTxOut(e).into());
+                    None
+                }
+            })
+            .find_map(|script| match is_owned(&script) {
+                Ok(false) => None,
+                Ok(true) => Some(InternalPayloadError::InputOwned(script).into()),
+                Err(e) => Some(Error::Implementation(e)),
+            })
+        {
+            return Err(e);
+        }
+        err?;
+        Ok(())
+    }
+
+    pub fn check_no_inputs_seen_before(
+        &self,
+        is_known: &mut impl FnMut(&OutPoint) -> Result<bool, ImplementationError>,
+    ) -> Result<(), Error> {
+        self.psbt.input_pairs().try_for_each(|input| {
+            match is_known(&input.txin.previous_output) {
+                Ok(false) => Ok::<(), Error>(()),
+                Ok(true) =>  {
+                    tracing::warn!("Request contains an input we've seen before: {}. Preventing possible probing attack.", input.txin.previous_output);
+                    Err(InternalPayloadError::InputSeen(input.txin.previous_output))?
+                },
+                Err(e) => Err(Error::Implementation(e))?,
+            }
+        })?;
+        Ok(())
+    }
+
+    pub fn identify_receiver_outputs(
+        self,
+        is_receiver_output: &mut impl FnMut(&Script) -> Result<bool, ImplementationError>,
+    ) -> Result<common::WantsOutputs, Error> {
+        let owned_vouts: Vec<usize> = self
+            .psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .filter_map(|(vout, txo)| match is_receiver_output(&txo.script_pubkey) {
+                Ok(true) => Some(Ok(vout)),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::Implementation)?;
+
+        if owned_vouts.is_empty() {
+            return Err(InternalPayloadError::MissingPayment.into());
+        }
+
+        let mut params = self.params.clone();
+        if let Some((_, additional_fee_output_index)) = params.additional_fee_contribution {
+            // If the additional fee output index specified by the sender is pointing to a receiver output,
+            // the receiver should ignore the parameter.
+            // https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#optional-parameters
+            if owned_vouts.contains(&additional_fee_output_index) {
+                params.additional_fee_contribution = None;
+            }
+        }
+        let original_payload = OriginalPayload { params, ..self.clone() };
+        Ok(common::WantsOutputs::new(original_payload, owned_vouts))
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use bitcoin::absolute::{LockTime, Time};
     use bitcoin::hashes::Hash;
     use bitcoin::key::{PublicKey, WPubkeyHash};
-    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::secp256k1::SECP256K1;
     use bitcoin::transaction::InputWeightPrediction;
     use bitcoin::{
-        witness, Amount, PubkeyHash, ScriptBuf, ScriptHash, Txid, WScriptHash, XOnlyPublicKey,
+        witness, Amount, PubkeyHash, ScriptBuf, ScriptHash, Sequence, Txid, WScriptHash,
+        XOnlyPublicKey,
     };
-    use payjoin_test_utils::{DUMMY20, DUMMY32};
+    use payjoin_test_utils::{
+        DUMMY20, DUMMY32, PARSED_ORIGINAL_PSBT, PARSED_PAYJOIN_PROPOSAL, QUERY_PARAMS,
+    };
 
     use super::*;
     use crate::psbt::InternalPsbtInputError::InvalidScriptPubKey;
+    use crate::psbt::NON_WITNESS_INPUT_WEIGHT;
 
-    // TODO: this is duplicated in a couple places. In these tests, receiver, and the sender.
-    // We should pub(crate) it and moved to a common place.
-    const NON_WITNESS_DATA_WEIGHT: Weight = Weight::from_non_witness_data_size(32 + 4 + 4);
+    pub(crate) fn original_from_test_vector() -> OriginalPayload {
+        let params = Params::from_query_str(QUERY_PARAMS, &[Version::One])
+            .expect("Could not parse params from query str");
+        OriginalPayload { psbt: PARSED_ORIGINAL_PSBT.clone(), params }
+    }
+
+    pub(crate) fn original_missing_prevtxout_from_test_vector() -> OriginalPayload {
+        let params = Params::from_query_str(QUERY_PARAMS, &[Version::One])
+            .expect("Could not parse params from query str");
+        let mut psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        for psbtin in psbt.inputs_mut() {
+            psbtin.non_witness_utxo = None;
+            psbtin.witness_utxo = None;
+        }
+        OriginalPayload { psbt: psbt.clone(), params }
+    }
+
+    pub(crate) fn psbt_context_from_test_vector() -> PsbtContext {
+        PsbtContext {
+            payjoin_psbt: PARSED_PAYJOIN_PROPOSAL.clone(),
+            original_psbt: PARSED_ORIGINAL_PSBT.clone(),
+        }
+    }
 
     #[test]
     fn input_pair_with_expected_weight() {
@@ -303,15 +560,12 @@ mod tests {
             output: vec![p2sh_txout, p2pkh_txout],
         };
         let outpoint = OutPoint { txid: utxo.compute_txid(), vout: 1 };
-        let sequence = Sequence::from_512_second_intervals(123);
-
-        let p2pkh_pair = InputPair::new_p2pkh(utxo.clone(), outpoint, Some(sequence)).unwrap();
+        let p2pkh_pair = InputPair::new_p2pkh(utxo.clone(), outpoint).unwrap();
         assert_eq!(p2pkh_pair.txin.previous_output, outpoint);
-        assert_eq!(p2pkh_pair.txin.sequence, sequence);
         assert_eq!(p2pkh_pair.psbtin.non_witness_utxo.unwrap(), utxo);
         assert_eq!(
             p2pkh_pair.expected_weight,
-            InputWeightPrediction::P2PKH_COMPRESSED_MAX.weight() + NON_WITNESS_DATA_WEIGHT
+            InputWeightPrediction::P2PKH_COMPRESSED_MAX.weight() + NON_WITNESS_INPUT_WEIGHT
         );
 
         // Failures
@@ -325,7 +579,7 @@ mod tests {
             }],
         };
         let outpoint = OutPoint { txid: utxo_with_p2sh.compute_txid(), vout: 0 };
-        let invalid_p2pkh_pair = InputPair::new_p2pkh(utxo_with_p2sh.clone(), outpoint, None);
+        let invalid_p2pkh_pair = InputPair::new_p2pkh(utxo_with_p2sh.clone(), outpoint);
         assert_eq!(
             invalid_p2pkh_pair.err().unwrap(),
             PsbtInputError::from(InvalidScriptPubKey(AddressType::P2pkh))
@@ -338,7 +592,7 @@ mod tests {
             output: vec![],
         };
         let outpoint = OutPoint { txid: utxo_empty_outputs.compute_txid(), vout: 0 };
-        let invalid_p2pkh_pair = InputPair::new_p2pkh(utxo_empty_outputs.clone(), outpoint, None);
+        let invalid_p2pkh_pair = InputPair::new_p2pkh(utxo_empty_outputs.clone(), outpoint);
         assert_eq!(
             invalid_p2pkh_pair.err().unwrap(),
             PsbtInputError::from(InternalPsbtInputError::PrevTxOut(
@@ -365,11 +619,9 @@ mod tests {
             output: vec![p2sh_txout, p2pkh_txout],
         };
         let outpoint = OutPoint { txid: utxo.compute_txid(), vout: 0 };
-        let sequence = Sequence::from_512_second_intervals(123);
         let redeem_script = ScriptBuf::new_p2sh(&ScriptHash::from_byte_array(DUMMY20));
 
-        let p2sh_pair =
-            InputPair::new_p2sh(utxo.clone(), outpoint, redeem_script.clone(), Some(sequence));
+        let p2sh_pair = InputPair::new_p2sh(utxo.clone(), outpoint, redeem_script.clone());
 
         assert_eq!(
             p2sh_pair.err().unwrap(),
@@ -389,7 +641,7 @@ mod tests {
         let outpoint = OutPoint { txid: utxo_with_p2pkh.compute_txid(), vout: 0 };
         let redeem_script = ScriptBuf::new_p2sh(&ScriptHash::from_byte_array(DUMMY20));
         let invalid_p2sh_pair =
-            InputPair::new_p2sh(utxo_with_p2pkh.clone(), outpoint, redeem_script.clone(), None);
+            InputPair::new_p2sh(utxo_with_p2pkh.clone(), outpoint, redeem_script.clone());
         assert_eq!(
             invalid_p2sh_pair.err().unwrap(),
             PsbtInputError::from(InvalidScriptPubKey(AddressType::P2sh))
@@ -403,7 +655,7 @@ mod tests {
         };
         let outpoint = OutPoint { txid: utxo_empty_outputs.compute_txid(), vout: 0 };
         let invalid_p2sh_pair =
-            InputPair::new_p2sh(utxo_empty_outputs.clone(), outpoint, redeem_script, None);
+            InputPair::new_p2sh(utxo_empty_outputs.clone(), outpoint, redeem_script);
         assert_eq!(
             invalid_p2sh_pair.err().unwrap(),
             PsbtInputError::from(InternalPsbtInputError::PrevTxOut(
@@ -415,19 +667,16 @@ mod tests {
     #[test]
     fn create_p2wpkh_input_pair() {
         let outpoint = OutPoint { txid: Txid::from_byte_array(DUMMY32), vout: 31 };
-        let sequence = Sequence::from_512_second_intervals(123);
         let p2wpkh_txout = TxOut {
             value: Amount::from_sat(12345),
             script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array(DUMMY20)),
         };
-        let p2wpkh_pair =
-            InputPair::new_p2wpkh(p2wpkh_txout.clone(), outpoint, Some(sequence)).unwrap();
+        let p2wpkh_pair = InputPair::new_p2wpkh(p2wpkh_txout.clone(), outpoint).unwrap();
         assert_eq!(p2wpkh_pair.txin.previous_output, outpoint);
-        assert_eq!(p2wpkh_pair.txin.sequence, sequence);
         assert_eq!(p2wpkh_pair.psbtin.witness_utxo.unwrap(), p2wpkh_txout);
         assert_eq!(
             p2wpkh_pair.expected_weight,
-            InputWeightPrediction::P2WPKH_MAX.weight() + NON_WITNESS_DATA_WEIGHT
+            InputWeightPrediction::P2WPKH_MAX.weight() + NON_WITNESS_INPUT_WEIGHT
         );
 
         let p2sh_txout = TxOut {
@@ -435,7 +684,7 @@ mod tests {
             script_pubkey: ScriptBuf::new_p2sh(&ScriptHash::all_zeros()),
         };
         assert_eq!(
-            InputPair::new_p2wpkh(p2sh_txout, outpoint, Some(sequence)).err().unwrap(),
+            InputPair::new_p2wpkh(p2sh_txout, outpoint).err().unwrap(),
             PsbtInputError::from(InvalidScriptPubKey(AddressType::P2wpkh))
         )
     }
@@ -443,23 +692,20 @@ mod tests {
     #[test]
     fn create_p2wsh_input_pair() {
         let outpoint = OutPoint { txid: Txid::from_byte_array(DUMMY32), vout: 31 };
-        let sequence = Sequence::from_512_second_intervals(123);
         let p2wsh_txout = TxOut {
             value: Amount::from_sat(12345),
             script_pubkey: ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array(DUMMY32)),
         };
         let expected_weight = Weight::from_wu(42);
-        let p2wsh_pair =
-            InputPair::new_p2wsh(p2wsh_txout.clone(), outpoint, Some(sequence), expected_weight)
-                .expect("valid params for p2wsh");
+        let p2wsh_pair = InputPair::new_p2wsh(p2wsh_txout.clone(), outpoint, expected_weight)
+            .expect("valid params for p2wsh");
 
         assert_eq!(p2wsh_pair.txin.previous_output, outpoint);
-        assert_eq!(p2wsh_pair.txin.sequence, sequence);
         assert_eq!(p2wsh_pair.psbtin.witness_utxo.unwrap(), p2wsh_txout);
         assert_eq!(p2wsh_pair.expected_weight, expected_weight);
 
         let p2wsh_pair = InputPair::new(
-            TxIn { previous_output: outpoint, sequence, ..Default::default() },
+            TxIn { previous_output: outpoint, ..Default::default() },
             psbt::Input { witness_utxo: Some(p2wsh_txout.clone()), ..Default::default() },
             None,
         );
@@ -474,9 +720,7 @@ mod tests {
             script_pubkey: ScriptBuf::new_p2sh(&ScriptHash::all_zeros()),
         };
         assert_eq!(
-            InputPair::new_p2wsh(p2sh_txout, outpoint, Some(sequence), expected_weight)
-                .err()
-                .unwrap(),
+            InputPair::new_p2wsh(p2sh_txout, outpoint, expected_weight).err().unwrap(),
             PsbtInputError::from(InvalidScriptPubKey(AddressType::P2wsh))
         );
 
@@ -516,30 +760,291 @@ mod tests {
     #[test]
     fn create_p2tr_input_pair() {
         let outpoint = OutPoint { txid: Txid::from_byte_array(DUMMY32), vout: 31 };
-        let sequence = Sequence::from_512_second_intervals(123);
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
         let pubkey = pubkey_string.parse::<PublicKey>().expect("valid pubkey");
         let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
         let p2tr_txout = TxOut {
             value: Amount::from_sat(12345),
-            script_pubkey: ScriptBuf::new_p2tr(&Secp256k1::new(), xonly_pubkey, None),
+            script_pubkey: ScriptBuf::new_p2tr(SECP256K1, xonly_pubkey, None),
         };
-        let p2tr_pair = InputPair::new_p2tr(p2tr_txout.clone(), outpoint, Some(sequence)).unwrap();
-        assert_eq!(p2tr_pair.txin.previous_output, outpoint);
-        assert_eq!(p2tr_pair.txin.sequence, sequence);
-        assert_eq!(p2tr_pair.psbtin.witness_utxo.unwrap(), p2tr_txout);
+
+        // Expected weight for p2tr keyspend
         assert_eq!(
-            p2tr_pair.expected_weight,
-            InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH.weight() + NON_WITNESS_DATA_WEIGHT
+            DEFAULT_SIGHASH_KEY_SPEND_INPUT_WEIGHT,
+            InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH.weight() + NON_WITNESS_INPUT_WEIGHT
+        );
+        let expected_key_weight = DEFAULT_SIGHASH_KEY_SPEND_INPUT_WEIGHT;
+        let keyspend_pair = InputPair::new_p2tr_keyspend(p2tr_txout.clone(), outpoint).unwrap();
+        assert_eq!(keyspend_pair.txin.previous_output, outpoint);
+        let witness_utxo = keyspend_pair.psbtin.witness_utxo.clone().unwrap();
+        assert_eq!(witness_utxo, p2tr_txout);
+        assert_eq!(keyspend_pair.expected_weight, expected_key_weight);
+
+        // Manual expected weight for p2tr scriptpath
+        let script_expected_weight = Weight::from_wu(2048);
+        let script_pair = InputPair::new_p2tr_scriptpath_spend(
+            p2tr_txout.clone(),
+            outpoint,
+            script_expected_weight,
+        )
+        .unwrap();
+        assert_eq!(script_pair.expected_weight, script_expected_weight);
+
+        // P2TR without witness requires explicit weight (cannot auto-detect spend type)
+        let txin = TxIn { previous_output: outpoint, ..Default::default() };
+        let psbtin = psbt::Input { witness_utxo: Some(witness_utxo.clone()), ..Default::default() };
+        let p2tr_pair = InputPair::new(txin.clone(), psbtin.clone(), None);
+        assert_eq!(
+            p2tr_pair.err().unwrap(),
+            PsbtInputError::from(InternalPsbtInputError::from(InputWeightError::NotSupported))
         );
 
+        // If UTXO is non-P2TR
         let p2sh_txout = TxOut {
             value: Default::default(),
             script_pubkey: ScriptBuf::new_p2sh(&ScriptHash::all_zeros()),
         };
         assert_eq!(
-            InputPair::new_p2tr(p2sh_txout, outpoint, Some(sequence)).err().unwrap(),
+            InputPair::new_p2tr_keyspend(p2sh_txout, outpoint).err().unwrap(),
             PsbtInputError::from(InvalidScriptPubKey(AddressType::P2tr))
         )
+    }
+
+    #[test]
+    fn p2tr_expected_weight_from_witness() {
+        let outpoint = OutPoint { txid: Txid::from_byte_array(DUMMY32), vout: 31 };
+        let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
+        let pubkey = pubkey_string.parse::<PublicKey>().expect("valid pubkey");
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let p2tr_txout = TxOut {
+            value: Amount::from_sat(12345),
+            script_pubkey: ScriptBuf::new_p2tr(SECP256K1, xonly_pubkey, None),
+        };
+        let base_txin = TxIn { previous_output: outpoint, ..Default::default() };
+        let psbtin = psbt::Input { witness_utxo: Some(p2tr_txout.clone()), ..Default::default() };
+
+        // P2tr with witness elements
+        let mut script_witness = witness::Witness::new();
+        script_witness.push(vec![0x03; 64]);
+        script_witness.push(vec![0x04; 5]);
+        script_witness.push(vec![0x05; 33]);
+        let txin = TxIn { witness: script_witness.clone(), ..base_txin.clone() };
+        let script_weight = Weight::from_non_witness_data_size(txin.base_size() as u64)
+            + Weight::from_witness_data_size(script_witness.size() as u64);
+        let pair = InputPair::new(txin, psbtin, None).expect("taproot witness provided");
+        assert_eq!(pair.expected_weight, script_weight);
+
+        // Witness stack supplied on the PSBT input instead of txin
+        let txin = TxIn { witness: witness::Witness::new(), ..base_txin.clone() };
+        let psbtin = psbt::Input {
+            witness_utxo: Some(p2tr_txout.clone()),
+            final_script_witness: Some(script_witness.clone()),
+            ..Default::default()
+        };
+        let pair = InputPair::new(txin.clone(), psbtin.clone(), None)
+            .expect("taproot witness provided via psbt input");
+        assert_eq!(pair.expected_weight, script_weight);
+
+        // Weight should not be manually provided if we can derive it from the witness stacks
+        let err = InputPair::new(txin, psbtin, Some(script_weight)).unwrap_err();
+        assert_eq!(err, PsbtInputError::from(InternalPsbtInputError::ProvidedUnnecessaryWeight));
+    }
+
+    #[test]
+    fn test_check_broadcast_suitability() {
+        let original = original_from_test_vector();
+
+        // Outcome 1: min_fee_rate too high → PsbtBelowFeeRate error
+        let err = original
+            .clone()
+            .check_broadcast_suitability(Some(FeeRate::MAX), |_| Ok(true))
+            .expect_err("Should fail when fee rate is below minimum");
+        match err {
+            Error::Protocol(ProtocolError::OriginalPayload(PayloadError(
+                InternalPayloadError::PsbtBelowFeeRate(original_fee_rate, min_fee_rate),
+            ))) => {
+                assert_eq!(original_fee_rate, original.psbt_fee_rate().unwrap());
+                assert_eq!(min_fee_rate, FeeRate::MAX);
+            }
+            _ => panic!("Expected PsbtBelowFeeRate error, got: {err:?}"),
+        }
+
+        // Outcome 2: can_broadcast returns false → OriginalPsbtNotBroadcastable error
+        let err = original
+            .clone()
+            .check_broadcast_suitability(None, |_| Ok(false))
+            .expect_err("Should fail when can_broadcast returns false");
+        match err {
+            Error::Protocol(ProtocolError::OriginalPayload(PayloadError(
+                InternalPayloadError::OriginalPsbtNotBroadcastable,
+            ))) => {}
+            _ => panic!("Expected OriginalPsbtNotBroadcastable error, got: {err:?}"),
+        }
+
+        // Outcome 3: can_broadcast returns an implementation error → Error::Implementation
+        let err = original
+            .clone()
+            .check_broadcast_suitability(None, |_| {
+                Err(ImplementationError::from("broadcast check failed"))
+            })
+            .expect_err("Should fail when can_broadcast returns an implementation error");
+        match err {
+            Error::Implementation(error_message) => {
+                assert_eq!(error_message.to_string(), "broadcast check failed".to_string())
+            }
+            _ => panic!("Expected Error::Implementation, got: {err:?}"),
+        }
+
+        // Outcome 4: success
+        original
+            .check_broadcast_suitability(None, |_| Ok(true))
+            .expect("Should succeed when fee rate is acceptable and can_broadcast returns true");
+    }
+
+    #[test]
+    fn test_check_inputs_not_owned() {
+        let original = original_from_test_vector();
+        let original_missing_prevtxout = original_missing_prevtxout_from_test_vector();
+
+        // Outcome 1: input_scripts returns a PrevTxOut error → Protocol error
+        let err = original_missing_prevtxout
+            .check_inputs_not_owned(&mut |_| Ok(false))
+            .expect_err("Should fail when previous txout is missing");
+        match err {
+            Error::Protocol(ProtocolError::OriginalPayload(PayloadError(
+                InternalPayloadError::PrevTxOut(_),
+            ))) => {}
+            _ => panic!("Expected PrevTxOut error, got: {err:?}"),
+        }
+
+        // Outcome 2: is_owned returns true → InputOwned error
+        let err = original
+            .clone()
+            .check_inputs_not_owned(&mut |_| Ok(true))
+            .expect_err("Should fail when input is owned");
+        match err {
+            Error::Protocol(ProtocolError::OriginalPayload(PayloadError(
+                InternalPayloadError::InputOwned(_),
+            ))) => {}
+            _ => panic!("Expected InputOwned error, got: {err:?}"),
+        }
+
+        // Outcome 3: is_owned returns an implementation error → Error::Implementation
+        let err = original
+            .clone()
+            .check_inputs_not_owned(&mut |_| {
+                Err(ImplementationError::from("ownership check failed"))
+            })
+            .expect_err("Should fail when is_owned returns an implementation error");
+        match err {
+            Error::Implementation(error_message) => {
+                assert_eq!(error_message.to_string(), "ownership check failed".to_string())
+            }
+            _ => panic!("Expected Error::Implementation, got: {err:?}"),
+        }
+
+        // Outcome 4: is_owned returns false → success
+        original
+            .check_inputs_not_owned(&mut |_| Ok(false))
+            .expect("Should succeed when no inputs are owned");
+    }
+
+    #[test]
+    fn test_check_no_inputs_seen_before() {
+        let original = original_from_test_vector();
+
+        // Outcome 1: is_known returns true → InputSeen error
+        let err = original
+            .clone()
+            .check_no_inputs_seen_before(&mut |_| Ok(true))
+            .expect_err("Should fail when input has been seen before");
+        match err {
+            Error::Protocol(ProtocolError::OriginalPayload(PayloadError(
+                InternalPayloadError::InputSeen(_),
+            ))) => {}
+            _ => panic!("Expected InputSeen error, got: {err:?}"),
+        }
+
+        // Outcome 2: is_known returns an implementation error → Error::Implementation
+        let err = original
+            .clone()
+            .check_no_inputs_seen_before(&mut |_| {
+                Err(ImplementationError::from("input seen check failed"))
+            })
+            .expect_err("Should fail when is_known returns an implementation error");
+        match err {
+            Error::Implementation(error_message) => {
+                assert_eq!(error_message.to_string(), "input seen check failed".to_string())
+            }
+            _ => panic!("Expected Error::Implementation, got: {err:?}"),
+        }
+
+        // Outcome 3: is_known returns false → success
+        original
+            .check_no_inputs_seen_before(&mut |_| Ok(false))
+            .expect("Should succeed when no inputs have been seen before");
+    }
+
+    #[test]
+    fn test_identify_receiver_outputs() {
+        let original = original_from_test_vector();
+
+        // Simple check that it correctly identifies the owned vouts and leaves params unchanged
+        let wants_outputs = original
+            .clone()
+            .identify_receiver_outputs(&mut |script| {
+                Ok(script == &PARSED_ORIGINAL_PSBT.unsigned_tx.output[1].script_pubkey)
+            })
+            .expect("receiver outputs should be identified");
+        assert_eq!(wants_outputs.owned_vouts, vec![1]);
+        assert_eq!(wants_outputs.params, original.params);
+
+        // No outputs belong to the receiver, it should error
+        let wants_outputs = original
+            .clone()
+            .identify_receiver_outputs(&mut |_| Ok(false))
+            .expect_err("should error");
+        assert_eq!(wants_outputs.to_string(), "Protocol error: Missing payment.");
+
+        // Fee contribution output belongs to the receiver, it should correctly identify owned
+        // vouts and ignore the additional fee contribution param
+        let params = Params {
+            additional_fee_contribution: Some((Amount::from_sat(182), 1)),
+            ..original.params
+        };
+        let original = OriginalPayload { params, ..original };
+        let wants_outputs = original
+            .identify_receiver_outputs(&mut |_| Ok(true))
+            .expect("receiver outputs should be identified");
+        assert_eq!(wants_outputs.owned_vouts, vec![0, 1]);
+        assert_eq!(wants_outputs.params.additional_fee_contribution, None);
+    }
+
+    #[test]
+    fn test_finalize_proposal() {
+        let psbt_context = psbt_context_from_test_vector();
+
+        // Outcome 1: wallet_process_psbt returns an implementation error → ImplementationError
+        let err = psbt_context
+            .clone()
+            .finalize_proposal(|_| Err(ImplementationError::from("wallet signing failed")))
+            .expect_err("Should fail when wallet_process_psbt returns an error");
+        assert_eq!(err.to_string(), "wallet signing failed");
+
+        // Outcome 2: wallet_process_psbt returns a psbt with mismatched ntxid → ImplementationError
+        let psbt_context = psbt_context_from_test_vector();
+        let err = psbt_context
+            .clone()
+            .finalize_proposal(|_| {
+                // return a totally different psbt to trigger ntxid mismatch
+                Ok(PARSED_ORIGINAL_PSBT.clone())
+            })
+            .expect_err("Should fail when ntxid mismatches");
+        assert!(err.to_string().contains("Ntxid mismatch"));
+
+        // Outcome 3: wallet_process_psbt succeeds → Ok(Psbt)
+        let _psbt = psbt_context
+            .finalize_proposal(|_| Ok(PARSED_PAYJOIN_PROPOSAL.clone()))
+            .expect("Should succeed when wallet_process_psbt returns a valid signed psbt");
     }
 }

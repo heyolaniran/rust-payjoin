@@ -3,6 +3,11 @@ use app::config::Config;
 use app::App as AppTrait;
 use clap::Parser;
 use cli::{Cli, Commands};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::EnvFilter;
+
+#[cfg(feature = "v2")]
+use crate::db::v2::SessionId;
 
 mod app;
 mod cli;
@@ -13,16 +18,18 @@ compile_error!("At least one of the features ['v1', 'v2'] must be enabled");
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    let env_filter =
+        EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy();
+    tracing_subscriber::fmt().with_target(true).with_level(true).with_env_filter(env_filter).init();
 
     let cli = Cli::parse();
     let config = Config::new(&cli)?;
 
     #[allow(clippy::if_same_then_else)]
-    let app: Box<dyn AppTrait> = if cli.flags.bip78.unwrap_or(false) {
+    let app: Box<dyn AppTrait> = if cli.flags.bip78 {
         #[cfg(feature = "v1")]
         {
-            Box::new(crate::app::v1::App::new(config)?)
+            Box::new(crate::app::v1::App::new(config).await?)
         }
         #[cfg(not(feature = "v1"))]
         {
@@ -30,10 +37,10 @@ async fn main() -> Result<()> {
                 "BIP78 (v1) support is not enabled in this build. Recompile with --features v1"
             )
         }
-    } else if cli.flags.bip77.unwrap_or(false) {
+    } else if cli.flags.bip77 {
         #[cfg(feature = "v2")]
         {
-            Box::new(crate::app::v2::App::new(config)?)
+            Box::new(crate::app::v2::App::new(config).await?)
         }
         #[cfg(not(feature = "v2"))]
         {
@@ -44,11 +51,11 @@ async fn main() -> Result<()> {
     } else {
         #[cfg(feature = "v2")]
         {
-            Box::new(crate::app::v2::App::new(config)?)
+            Box::new(crate::app::v2::App::new(config).await?)
         }
         #[cfg(all(feature = "v1", not(feature = "v2")))]
         {
-            Box::new(crate::app::v1::App::new(config)?)
+            Box::new(crate::app::v1::App::new(config).await?)
         }
         #[cfg(not(any(feature = "v1", feature = "v2")))]
         {
@@ -66,6 +73,14 @@ async fn main() -> Result<()> {
         #[cfg(feature = "v2")]
         Commands::Resume => {
             app.resume_payjoins().await?;
+        }
+        #[cfg(feature = "v2")]
+        Commands::History => {
+            app.history().await?;
+        }
+        #[cfg(feature = "v2")]
+        Commands::Cancel { session_id, no_broadcast, role } => {
+            app.cancel(SessionId(*session_id), *no_broadcast, *role).await?;
         }
     };
 

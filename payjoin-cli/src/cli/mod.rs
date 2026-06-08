@@ -1,17 +1,16 @@
 use std::path::PathBuf;
 
-use clap::{value_parser, Parser, Subcommand};
+use clap::{value_parser, Parser, Subcommand, ValueEnum};
 use payjoin::bitcoin::amount::ParseAmountError;
 use payjoin::bitcoin::{Amount, FeeRate};
-use serde::Deserialize;
-use url::Url;
+use payjoin::Url;
 
-#[derive(Debug, Clone, Deserialize, Parser)]
+#[derive(Debug, Parser)]
 pub struct Flags {
-    #[arg(long = "bip77", help = "Use BIP77 (v2) protocol (default)", action = clap::ArgAction::SetTrue)]
-    pub bip77: Option<bool>,
-    #[arg(long = "bip78", help = "Use BIP78 (v1) protocol", action = clap::ArgAction::SetTrue)]
-    pub bip78: Option<bool>,
+    #[arg(long, help = "Use BIP77 (v2) protocol (default)")]
+    pub bip77: bool,
+    #[arg(long, help = "Use BIP78 (v1) protocol")]
+    pub bip78: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -75,6 +74,14 @@ pub struct Cli {
     #[cfg(feature = "v2")]
     #[arg(long = "pj-directory", help = "The directory to store payjoin requests", value_parser = value_parser!(Url))]
     pub pj_directory: Option<Url>,
+
+    #[cfg(feature = "_manual-tls")]
+    #[arg(long = "root-certificate", help = "Specify a TLS certificate to be added as a root", value_parser = value_parser!(PathBuf))]
+    pub root_certificate: Option<PathBuf>,
+
+    #[cfg(feature = "_manual-tls")]
+    #[arg(long = "certificate-key", help = "Specify the certificate private key", value_parser = value_parser!(PathBuf))]
+    pub certificate_key: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,13 +113,13 @@ pub enum Commands {
 
         #[cfg(feature = "v1")]
         /// The `pj=` endpoint to receive the payjoin request
-        #[arg(long = "pj-endpoint", value_parser = value_parser!(Url))]
-        pj_endpoint: Option<Url>,
+        #[arg(long = "pj-endpoint", value_parser = parse_boxed_url)]
+        pj_endpoint: Option<Box<Url>>,
 
         #[cfg(feature = "v2")]
         /// The directory to store payjoin requests
-        #[arg(long = "pj-directory", value_parser = value_parser!(Url))]
-        pj_directory: Option<Url>,
+        #[arg(long = "pj-directory", value_parser = parse_boxed_url)]
+        pj_directory: Option<Box<Url>>,
 
         #[cfg(feature = "v2")]
         /// The path to the ohttp keys file
@@ -122,6 +129,30 @@ pub enum Commands {
     /// Resume pending payjoins (BIP77/v2 only)
     #[cfg(feature = "v2")]
     Resume,
+    #[cfg(feature = "v2")]
+    /// Show payjoin session history
+    History,
+    #[cfg(feature = "v2")]
+    /// Cancel a sender or receiver session, broadcasting the fallback transaction by default (BIP77/v2 only)
+    Cancel {
+        /// The session ID to cancel
+        #[arg(required = true)]
+        session_id: i64,
+
+        /// Cancel without broadcasting the fallback transaction
+        #[arg(long = "no-broadcast")]
+        no_broadcast: bool,
+
+        /// The session role to cancel
+        #[arg(long = "role", value_enum)]
+        role: Option<Role>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Role {
+    Sender,
+    Receiver,
 }
 
 pub fn parse_amount_in_sat(s: &str) -> Result<Amount, ParseAmountError> {
@@ -132,4 +163,8 @@ pub fn parse_fee_rate_in_sat_per_vb(s: &str) -> Result<FeeRate, std::num::ParseF
     let fee_rate_sat_per_vb: f32 = s.parse()?;
     let fee_rate_sat_per_kwu = fee_rate_sat_per_vb * 250.0_f32;
     Ok(FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu.ceil() as u64))
+}
+
+fn parse_boxed_url(s: &str) -> Result<Box<Url>, String> {
+    s.parse::<Url>().map(Box::new).map_err(|e| e.to_string())
 }

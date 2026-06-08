@@ -1,35 +1,29 @@
 use std::io;
 use std::sync::Arc;
 
-use bitcoin_ffi::Psbt;
-use bitcoincore_rpc::RpcApi;
-use bitcoind::bitcoincore_rpc;
-use bitcoind::bitcoincore_rpc::json::AddressType;
 use lazy_static::lazy_static;
+use payjoin_test_utils::corepc_node::AddressType;
 use payjoin_test_utils::{
-    EXAMPLE_URL, INVALID_PSBT, ORIGINAL_PSBT, PARSED_ORIGINAL_PSBT, PARSED_PAYJOIN_PROPOSAL,
-    PARSED_PAYJOIN_PROPOSAL_WITH_SENDER_INFO, PAYJOIN_PROPOSAL, PAYJOIN_PROPOSAL_WITH_SENDER_INFO,
-    QUERY_PARAMS, RECEIVER_INPUT_CONTRIBUTION,
+    corepc_node, EXAMPLE_URL, INVALID_PSBT, ORIGINAL_PSBT, PAYJOIN_PROPOSAL,
+    PAYJOIN_PROPOSAL_WITH_SENDER_INFO, QUERY_PARAMS, RECEIVER_INPUT_CONTRIBUTION,
 };
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-
-use crate::Url;
 
 lazy_static! {
     static ref RUNTIME: Arc<std::sync::Mutex<Runtime>> =
         Arc::new(std::sync::Mutex::new(Runtime::new().expect("Failed to create Tokio runtime")));
 }
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(uniffi::Object)]
 pub struct BitcoindEnv {
     pub bitcoind: Arc<BitcoindInstance>,
     pub receiver: Arc<RpcClient>,
     pub sender: Arc<RpcClient>,
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 impl BitcoindEnv {
     pub fn get_receiver(&self) -> Arc<RpcClient> { self.receiver.clone() }
 
@@ -38,17 +32,17 @@ impl BitcoindEnv {
     pub fn get_bitcoind(&self) -> Arc<BitcoindInstance> { self.bitcoind.clone() }
 }
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(uniffi::Object)]
 pub struct BitcoindInstance {
-    _inner: bitcoind::BitcoinD,
+    _inner: corepc_node::Node,
 }
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(uniffi::Object)]
 pub struct RpcClient {
-    inner: bitcoincore_rpc::Client,
+    inner: corepc_node::Client,
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 impl RpcClient {
     pub fn call(&self, method: String, params: Vec<Option<String>>) -> Result<String, FfiError> {
         let parsed_params: Vec<Value> = params
@@ -69,8 +63,7 @@ impl RpcClient {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, uniffi::Error)]
 pub enum FfiError {
     #[error("Init error: {0}")]
     InitError(String),
@@ -84,25 +77,25 @@ impl FfiError {
     pub fn new(msg: impl Into<String>) -> Self { FfiError::Message(msg.into()) }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display)]
 #[error(transparent)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct BoxSendSyncError(#[from] payjoin_test_utils::BoxSendSyncError);
 
 impl From<io::Error> for BoxSendSyncError {
     fn from(err: io::Error) -> Self { payjoin_test_utils::BoxSendSyncError::from(err).into() }
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn init_tracing() { payjoin_test_utils::init_tracing(); }
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(uniffi::Object)]
 pub struct JoinHandle(
     #[allow(dead_code)]
     Arc<tokio::task::JoinHandle<Result<(), payjoin_test_utils::BoxSendSyncError>>>,
 );
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[derive(uniffi::Object)]
 pub struct TestServices(pub(crate) Mutex<payjoin_test_utils::TestServices>);
 
 impl From<payjoin_test_utils::TestServices> for TestServices {
@@ -113,9 +106,9 @@ impl From<TestServices> for payjoin_test_utils::TestServices {
     fn from(value: TestServices) -> Self { value.0.into_inner() }
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 impl TestServices {
-    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    #[uniffi::constructor]
     pub fn initialize() -> Result<Self, BoxSendSyncError> {
         let runtime = RUNTIME.lock().expect("Lock should not be poisoned");
         let service = runtime.block_on(async {
@@ -132,9 +125,9 @@ impl TestServices {
         runtime.block_on(async { self.0.lock().await.cert() })
     }
 
-    pub fn directory_url(&self) -> Url {
+    pub fn directory_url(&self) -> String {
         let runtime = RUNTIME.lock().expect("Lock should not be poisoned");
-        runtime.block_on(async { self.0.lock().await.directory_url().into() })
+        runtime.block_on(async { self.0.lock().await.directory_url() })
     }
 
     pub fn take_directory_handle(&self) -> JoinHandle {
@@ -143,14 +136,14 @@ impl TestServices {
             .block_on(async { JoinHandle(Arc::new(self.0.lock().await.take_directory_handle())) })
     }
 
-    pub fn ohttp_relay_url(&self) -> Url {
+    pub fn ohttp_relay_url(&self) -> String {
         let runtime = RUNTIME.lock().expect("Lock should not be poisoned");
-        runtime.block_on(async { self.0.lock().await.ohttp_relay_url().into() })
+        runtime.block_on(async { self.0.lock().await.ohttp_relay_url() })
     }
 
-    pub fn ohttp_gateway_url(&self) -> Url {
+    pub fn ohttp_gateway_url(&self) -> String {
         let runtime = RUNTIME.lock().expect("Lock should not be poisoned");
-        runtime.block_on(async { self.0.lock().await.ohttp_gateway_url().into() })
+        runtime.block_on(async { self.0.lock().await.ohttp_gateway_url() })
     }
 
     pub fn take_ohttp_relay_handle(&self) -> JoinHandle {
@@ -171,15 +164,21 @@ impl TestServices {
         })
     }
 
-    pub fn fetch_ohttp_keys(&self) -> Result<crate::OhttpKeys, crate::io::IoError> {
+    pub fn fetch_ohttp_keys(&self) -> Result<crate::OhttpKeys, BoxSendSyncError> {
         let runtime = RUNTIME.lock().expect("Lock should not be poisoned");
         runtime.block_on(async {
-            self.0.lock().await.fetch_ohttp_keys().await.map_err(Into::into).map(Into::into)
+            self.0
+                .lock()
+                .await
+                .fetch_ohttp_keys()
+                .await
+                .map(Into::into)
+                .map_err(|e| payjoin_test_utils::BoxSendSyncError::from(e).into())
         })
     }
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn init_bitcoind_sender_receiver() -> Result<Arc<BitcoindEnv>, FfiError> {
     let (bitcoind, receiver, sender) = payjoin_test_utils::init_bitcoind_sender_receiver(
         Some(AddressType::Bech32),
@@ -194,36 +193,25 @@ pub fn init_bitcoind_sender_receiver() -> Result<Arc<BitcoindEnv>, FfiError> {
     }))
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn example_url() -> Url { EXAMPLE_URL.clone().into() }
+#[uniffi::export]
+pub fn example_url() -> String { EXAMPLE_URL.to_string() }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn query_params() -> String { QUERY_PARAMS.to_string() }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn original_psbt() -> String { ORIGINAL_PSBT.to_string() }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn invalid_psbt() -> String { INVALID_PSBT.to_string() }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn payjoin_proposal() -> String { PAYJOIN_PROPOSAL.to_string() }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn payjoin_proposal_with_sender_info() -> String {
     PAYJOIN_PROPOSAL_WITH_SENDER_INFO.to_string()
 }
 
-#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[uniffi::export]
 pub fn receiver_input_contribution() -> String { RECEIVER_INPUT_CONTRIBUTION.to_string() }
-
-#[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn parsed_original_psbt() -> Psbt { PARSED_ORIGINAL_PSBT.clone().into() }
-
-#[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn parsed_payjoin_proposal() -> Psbt { PARSED_PAYJOIN_PROPOSAL.clone().into() }
-
-#[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn parsed_payjoin_proposal_with_sender_info() -> Psbt {
-    PARSED_PAYJOIN_PROPOSAL_WITH_SENDER_INFO.clone().into()
-}

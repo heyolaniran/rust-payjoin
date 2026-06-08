@@ -1,5 +1,5 @@
-use url::Url;
-
+use crate::core::Url;
+#[cfg(feature = "v1")]
 const V1_REQ_CONTENT_TYPE: &str = "text/plain";
 
 #[cfg(feature = "v2")]
@@ -13,7 +13,7 @@ pub struct Request {
     /// URL to send the request to.
     ///
     /// This is full URL with scheme etc - you can pass it right to `reqwest` or a similar library.
-    pub url: Url,
+    pub url: String,
 
     /// The `Content-Type` header to use for the request.
     ///
@@ -28,8 +28,9 @@ pub struct Request {
 
 impl Request {
     /// Construct a new v1 request.
+    #[cfg(feature = "v1")]
     pub(crate) fn new_v1(url: &Url, body: &[u8]) -> Self {
-        Self { url: url.clone(), content_type: V1_REQ_CONTENT_TYPE, body: body.to_vec() }
+        Self { url: url.to_string(), content_type: V1_REQ_CONTENT_TYPE, body: body.to_vec() }
     }
 
     /// Construct a new v2 request.
@@ -38,6 +39,6 @@ impl Request {
         url: &Url,
         body: &[u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES],
     ) -> Self {
-        Self { url: url.clone(), content_type: V2_REQ_CONTENT_TYPE, body: body.to_vec() }
+        Self { url: url.to_string(), content_type: V2_REQ_CONTENT_TYPE, body: body.to_vec() }
     }
 }

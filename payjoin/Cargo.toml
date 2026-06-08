@@ -1,16 +1,20 @@
 [package]
 name = "payjoin"
-version = "0.24.0"
+version = "1.0.0-rc.3"
 authors = ["Dan Gould <d@ngould.dev>"]
 description = "Payjoin Library implementing BIP 78 and BIP 77 batching protocols."
 repository = "https://github.com/payjoin/rust-payjoin"
 readme = "../README.md"
 keywords = ["bip78", "payjoin", "bitcoin"]
-categories = ["api-bindings", "cryptography::cryptocurrencies", "network-programming"]
+categories = [
+  "api-bindings",
+  "cryptography::cryptocurrencies",
+  "network-programming",
+]
 license = "MITNFA"
 resolver = "2"
 edition = "2021"
-rust-version = "1.63"
+rust-version = "1.85"
 exclude = ["tests"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -18,36 +22,50 @@ exclude = ["tests"]
 [features]
 default = ["v2"]
 #[doc = "Core features for payjoin state machines"]
-_core = ["bitcoin/rand-std", "serde_json", "url", "bitcoin_uri", "serde", "bitcoin/serde"]
+_core = [
+  "bitcoin/rand-std",
+  "dep:http",
+  "serde_json",
+  "dep:percent-encoding-rfc3986",
+  "bitcoin_uri",
+  "serde",
+  "bitcoin/serde",
+]
 directory = []
 v1 = ["_core"]
-v2 = ["_core", "hpke", "dep:http", "bhttp", "ohttp", "url/serde", "directory"]
+v2 = ["_core", "hpke", "bhttp", "ohttp", "directory"]
 #[doc = "Functions to fetch OHTTP keys via CONNECT proxy using reqwest. Enables `v2` since only `v2` uses OHTTP."]
 io = ["v2", "reqwest/rustls-tls"]
-_danger-local-https = ["reqwest/rustls-tls", "rustls"]
-_multiparty = ["v2"]
-_test-utils = []
+_manual-tls = ["rustls"]
 
 [dependencies]
-bitcoin = { version = "0.32.5", features = ["base64"] }
+bhttp = { version = "0.6.1", optional = true }
+bitcoin = { version = "0.32.7", features = ["base64"] }
+bitcoin-units = "0.1.3"
 bitcoin_uri = { version = "0.1.0", optional = true }
 hpke = { package = "bitcoin-hpke", version = "0.13.0", optional = true }
-log = { version = "0.4.14"}
-http = { version = "1.1.0", optional = true }
-bhttp = { version = "=0.5.1", optional = true }
+http = { version = "1.3.1", optional = true }
 ohttp = { package = "bitcoin-ohttp", version = "0.6.0", optional = true }
-serde = { version = "1.0.186", default-features = false, optional = true }
-reqwest = { version = "0.12", default-features = false, optional = true }
-rustls = { version = "0.22.4", optional = true }
-url = { version = "2.2.2", optional = true }
-serde_json = { version = "1.0.108", optional = true }
+percent-encoding-rfc3986 = { version = "0.1.3", optional = true }
+reqwest = { version = "0.12.23", default-features = false, optional = true }
+rustls = { version = "0.23.31", optional = true, default-features = false, features = [
+  "ring",
+] }
+serde = { version = "1.0.219", default-features = false, optional = true }
+serde_json = { version = "1.0.142", optional = true }
+tracing = "0.1.41"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1.0"
+
+[package.metadata.cargo-machete]
+ignored = ["bitcoin-units"]
 
 [dev-dependencies]
-bitcoind = { version = "0.36.0", features = ["0_21_2"] }
-payjoin-test-utils = { version = "0.0.1" }
-once_cell = "1.19.0"
-tokio = { version = "1.38.1", features = ["full"] }
-tracing = "0.1.40"
+once_cell = "1.21.3"
+payjoin-test-utils = { path = "../payjoin-test-utils", features = ["v2"] }
+tokio = { version = "1.47.1", features = ["full"] }
+tracing = "0.1.41"
 
 [package.metadata.docs.rs]
 all-features = true

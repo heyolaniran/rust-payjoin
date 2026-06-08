@@ -1,8 +1,5 @@
 //! Utilities to make work with PSBTs easier
 
-#[cfg(feature = "_multiparty")]
-pub(crate) mod merge;
-
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -10,8 +7,13 @@ use bitcoin::address::FromScriptError;
 use bitcoin::psbt::Psbt;
 use bitcoin::transaction::InputWeightPrediction;
 use bitcoin::{bip32, psbt, Address, AddressType, Network, TxIn, TxOut, Weight};
+/// Shared non-witness weight for txid (32), index (4), and sequence (4) fields.
+/// We only need to add the weight of the txid: 32, index: 4 and sequence: 4 as rust_bitcoin
+/// already accounts for the scriptsig length when calculating InputWeightPrediction
+/// <https://docs.rs/bitcoin/latest/src/bitcoin/blockdata/transaction.rs.html#1621>
+pub(crate) const NON_WITNESS_INPUT_WEIGHT: Weight = Weight::from_non_witness_data_size(32 + 4 + 4);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InconsistentPsbt {
     UnequalInputCounts { tx_ins: usize, psbt_ins: usize },
     UnequalOutputCounts { tx_outs: usize, psbt_outs: usize },
@@ -230,12 +232,24 @@ impl InternalInputPair<'_> {
                         .ok_or(InputWeightError::NotSupported)?;
                     Ok(iwp)
                 },
-            P2tr => Ok(InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH),
+            P2tr => {
+                let witness = if !self.txin.witness.is_empty() {
+                    Some(&self.txin.witness)
+                } else {
+                    self.psbtin.final_script_witness.as_ref().filter(|w| !w.is_empty())
+                };
+                match witness {
+                    Some(w) => Ok(InputWeightPrediction::new(
+                        0,
+                        w.iter().map(|el| el.len()).collect::<Vec<_>>(),
+                    )),
+                    None => Err(InputWeightError::NotSupported),
+                }
+            }
             _ => Err(AddressTypeError::UnknownAddressType.into()),
         }?;
-
         // Lengths of txid, index and sequence: (32, 4, 4).
-        let input_weight = iwp.weight() + Weight::from_non_witness_data_size(32 + 4 + 4);
+        let input_weight = iwp.weight() + NON_WITNESS_INPUT_WEIGHT;
         Ok(input_weight)
     }
 }
@@ -348,6 +362,7 @@ pub(crate) enum AddressTypeError {
     PrevTxOut(PrevTxOutError),
     InvalidScript(FromScriptError),
     UnknownAddressType,
+    FeeRateOverflow,
 }
 
 impl fmt::Display for AddressTypeError {
@@ -356,6 +371,7 @@ impl fmt::Display for AddressTypeError {
             Self::PrevTxOut(_) => write!(f, "invalid previous transaction output"),
             Self::InvalidScript(_) => write!(f, "invalid script"),
             Self::UnknownAddressType => write!(f, "unknown address type"),
+            Self::FeeRateOverflow => write!(f, "fee rate overflow"),
         }
     }
 }
@@ -366,6 +382,7 @@ impl std::error::Error for AddressTypeError {
             Self::PrevTxOut(error) => Some(error),
             Self::InvalidScript(error) => Some(error),
             Self::UnknownAddressType => None,
+            Self::FeeRateOverflow => None,
         }
     }
 }
@@ -406,4 +423,122 @@ impl std::error::Error for InputWeightError {
 }
 impl From<AddressTypeError> for InputWeightError {
     fn from(value: AddressTypeError) -> Self { Self::AddressType(value) }
+}
+
+#[cfg(test)]
+mod test {
+    use bitcoin::{Psbt, ScriptBuf, Transaction};
+    use payjoin_test_utils::PARSED_ORIGINAL_PSBT;
+
+    use crate::psbt::{InputWeightError, InternalInputPair, InternalPsbtInputError, PsbtExt};
+
+    #[test]
+    fn validate_input_utxos() {
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let validated_pairs = psbt.validate_input_utxos();
+        assert!(validated_pairs.is_ok());
+    }
+
+    #[test]
+    fn input_pairs_validate_witness_utxo() {
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let txin = &psbt.unsigned_tx.input[0];
+        let psbtin = &psbt.inputs[0];
+
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin };
+        assert!(pair.validate_utxo().is_ok());
+    }
+
+    #[test]
+    fn input_pairs_validate_non_witness_utxo() {
+        // This test checks each variation of the validate_utxo match block with no
+        // non_witness_utxo
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let raw_tx = "010000000001015721029046ec1840d5bc8f4e59ae8ac4b576191d5e7994c8d1c44ddeaffc176c0300000000fdffffff018e8d00000000000017a9144a87748bc7bcfee8290e36700eeca3112f53ecbe870140239d1975e0fc9b8345bce9a170a0224cf8eb327bfcaccf0f8b9434d17345579e4dcbb68f7be39eac7987dfaa08293b11fdc76ac28e26bd85e99a46b69675418100000000";
+
+        let mut txin = psbt.unsigned_tx.input[0].clone();
+        let mut psbtin = psbt.inputs[0].clone();
+
+        let transaction: Transaction = bitcoin::consensus::encode::deserialize_hex(raw_tx).unwrap();
+        psbtin.non_witness_utxo = Some(transaction.clone());
+        psbtin.witness_utxo = None;
+        txin.previous_output.txid = transaction.compute_txid();
+
+        let pair: InternalInputPair = InternalInputPair { txin: &txin, psbtin: &psbtin };
+        assert!(pair.validate_utxo().is_ok());
+    }
+
+    #[test]
+    fn input_pairs_unequal_txid() {
+        // This test checks each variation of the validate_utxo match block where is it expected to
+        // return an unequal_txid error
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let raw_tx = "010000000001015721029046ec1840d5bc8f4e59ae8ac4b576191d5e7994c8d1c44ddeaffc176c0300000000fdffffff018e8d00000000000017a9144a87748bc7bcfee8290e36700eeca3112f53ecbe870140239d1975e0fc9b8345bce9a170a0224cf8eb327bfcaccf0f8b9434d17345579e4dcbb68f7be39eac7987dfaa08293b11fdc76ac28e26bd85e99a46b69675418100000000";
+
+        let txin = &psbt.unsigned_tx.input[0];
+        let mut psbtin = psbt.inputs[0].clone();
+
+        let transaction: Transaction = bitcoin::consensus::encode::deserialize_hex(raw_tx).unwrap();
+        psbtin.non_witness_utxo = Some(transaction);
+
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin: &psbtin };
+        let validated_utxo = pair.validate_utxo();
+        assert_eq!(validated_utxo.unwrap_err(), InternalPsbtInputError::UnequalTxid);
+
+        let txin = &psbt.unsigned_tx.input[0];
+        let mut psbtin = psbt.inputs[0].clone();
+
+        let transaction: Transaction = bitcoin::consensus::encode::deserialize_hex(raw_tx).unwrap();
+        psbtin.non_witness_utxo = Some(transaction);
+        psbtin.witness_utxo = None;
+
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin: &psbtin };
+        let validated_utxo = pair.validate_utxo();
+        assert_eq!(validated_utxo.unwrap_err(), InternalPsbtInputError::UnequalTxid);
+    }
+
+    #[test]
+    fn input_pairs_txout_mismatch() {
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let raw_tx = "010000000001015721029046ec1840d5bc8f4e59ae8ac4b576191d5e7994c8d1c44ddeaffc176c0300000000fdffffff018e8d00000000000017a9144a87748bc7bcfee8290e36700eeca3112f53ecbe870140239d1975e0fc9b8345bce9a170a0224cf8eb327bfcaccf0f8b9434d17345579e4dcbb68f7be39eac7987dfaa08293b11fdc76ac28e26bd85e99a46b69675418100000000";
+
+        let mut txin = psbt.unsigned_tx.input[0].clone();
+        let mut psbtin = psbt.inputs[0].clone();
+
+        let transaction: Transaction = bitcoin::consensus::encode::deserialize_hex(raw_tx).unwrap();
+        psbtin.non_witness_utxo = Some(transaction.clone());
+        txin.previous_output.txid = transaction.compute_txid();
+
+        let pair: InternalInputPair = InternalInputPair { txin: &txin, psbtin: &psbtin };
+        let validated_utxo = pair.validate_utxo();
+        assert_eq!(validated_utxo.unwrap_err(), InternalPsbtInputError::SegWitTxOutMismatch);
+    }
+
+    #[test]
+    fn expected_input_weight() {
+        let psbt: Psbt = PARSED_ORIGINAL_PSBT.clone();
+        let txin = &psbt.unsigned_tx.input[0];
+        let psbtin = psbt.inputs[0].clone();
+
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin: &psbtin };
+        let weight = pair.expected_input_weight();
+        assert!(weight.is_ok());
+
+        let mut psbtin = psbt.inputs[0].clone();
+        psbtin.final_script_sig = Some(
+            ScriptBuf::from_hex(
+                "22002065f91a53cb7120057db3d378bd0f7d944167d43a7dcbff15d6afc4823f1d3ed3",
+            )
+            .unwrap(),
+        );
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin: &psbtin };
+        let weight = pair.expected_input_weight();
+        assert_eq!(weight.unwrap_err(), InputWeightError::NotSupported);
+
+        let mut psbtin = psbt.inputs[0].clone();
+        psbtin.final_script_sig = None;
+        let pair: InternalInputPair = InternalInputPair { txin, psbtin: &psbtin };
+        let weight = pair.expected_input_weight();
+        assert_eq!(weight.unwrap_err(), InputWeightError::NoRedeemScript)
+    }
 }

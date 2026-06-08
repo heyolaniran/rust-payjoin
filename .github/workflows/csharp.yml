@@ -1,0 +1,63 @@
+name: Build and Test CSharp
+on:
+  workflow_run:
+    workflows: ["Flake maintenance"]
+    types: [requested]
+    branches:
+      - "update_flake_lock_action"
+  pull_request:
+    paths:
+      - payjoin-ffi/**
+
+jobs:
+  build-csharp-and-test-unix:
+    name: "Build and test csharp"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: "Use cache"
+        uses: Swatinem/rust-cache@v2
+      - name: "Install nix"
+        uses: DeterminateSystems/determinate-nix-action@main
+      - name: "Use nix cache"
+        uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: "Build and test"
+        run: nix develop .#csharp -c ./payjoin-ffi/csharp/contrib/test.sh
+
+  build-csharp-and-test-windows:
+    name: "Build and test csharp (windows)"
+    runs-on: windows-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.85
+    defaults:
+      run:
+        working-directory: payjoin-ffi/csharp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust 1.85.0
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Use cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Verify .NET SDK
+        run: |
+          dotnet --version
+          dotnet --list-sdks
+
+      - name: Generate bindings and binaries
+        shell: pwsh
+        run: ./scripts/generate_bindings.ps1
+
+      - name: Run tests
+        run: dotnet test --logger "console;verbosity=minimal"

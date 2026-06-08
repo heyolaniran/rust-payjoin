@@ -1,31 +1,50 @@
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
 #[error("Error parsing the payjoin URI: {msg}")]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct PjParseError {
     msg: String,
 }
 
-impl From<String> for PjParseError {
-    fn from(msg: String) -> Self { PjParseError { msg } }
+impl PjParseError {
+    pub(crate) fn from_err(err: impl std::fmt::Display) -> Self { Self { msg: err.to_string() } }
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display, Eq)]
 #[error("URI doesn't support payjoin: {msg}")]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct PjNotSupported {
     msg: String,
 }
 
-impl From<String> for PjNotSupported {
-    fn from(msg: String) -> Self { PjNotSupported { msg } }
+impl PjNotSupported {
+    pub(crate) fn from_display(uri: impl std::fmt::Display) -> Self {
+        Self { msg: uri.to_string() }
+    }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display)]
 #[error(transparent)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-pub struct UrlParseError(#[from] payjoin::ParseError);
+pub struct UrlParseError(#[from] url::ParseError);
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display)]
 #[error(transparent)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct IntoUrlError(#[from] payjoin::IntoUrlError);
+
+#[derive(Debug, thiserror::Error, uniffi::Object)]
+#[uniffi::export(Debug, Display)]
+#[error("{msg}")]
+pub struct FeeRateError {
+    msg: String,
+}
+
+impl FeeRateError {
+    pub(crate) fn overflow(value_sat_per_vb: u64) -> Self {
+        Self {
+            msg: format!(
+                "Fee rate {value_sat_per_vb} sat/vB exceeds the supported range for this platform"
+            ),
+        }
+    }
+}

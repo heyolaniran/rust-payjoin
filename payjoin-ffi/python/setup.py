@@ -5,9 +5,9 @@ from setuptools import setup
 import toml
 
 # Read version from Cargo.toml
-cargo_toml_path = os.path.join(os.path.dirname(__file__), '..', 'Cargo.toml')
+cargo_toml_path = os.path.join(os.path.dirname(__file__), "..", "Cargo.toml")
 cargo_toml = toml.load(cargo_toml_path)
-version = cargo_toml['package']['version']
+version = cargo_toml["package"]["version"]
 
 LONG_DESCRIPTION = """# payjoin
 This repository creates libraries for various programming languages, all using the Rust-based [Payjoin](https://github.com/payjoin/rust-payjoin) 
@@ -16,9 +16,12 @@ as the core implementation of BIP77, sourced from the [Payjoin Dev Kit](https://
 ## Install the package
 ```shell
 pip install payjoin
+
+# Or, if using uv
+uv add payjoin
 ```
 
-## Usage 
+## Usage
 ```python
 import payjoin as payjoin
 """

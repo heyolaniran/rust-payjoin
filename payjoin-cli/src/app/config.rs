@@ -4,12 +4,13 @@ use anyhow::Result;
 use config::builder::DefaultState;
 use config::{ConfigError, File, FileFormat};
 use payjoin::bitcoin::FeeRate;
-use payjoin::Version;
+use payjoin::{Url, Version};
 use serde::Deserialize;
-use url::Url;
 
 use crate::cli::{Cli, Commands};
 use crate::db;
+
+const CONFIG_DIR: &str = "payjoin-cli";
 
 type Builder = config::builder::ConfigBuilder<DefaultState>;
 
@@ -56,6 +57,10 @@ pub struct Config {
     pub bitcoind: BitcoindConfig,
     #[serde(skip)]
     pub version: Option<VersionConfig>,
+    #[cfg(feature = "_manual-tls")]
+    pub root_certificate: Option<PathBuf>,
+    #[cfg(feature = "_manual-tls")]
+    pub certificate_key: Option<PathBuf>,
 }
 
 impl Config {
@@ -64,12 +69,12 @@ impl Config {
         let mut selected_version = None;
 
         // Check for BIP77 (v2)
-        if cli.flags.bip77.unwrap_or(false) {
+        if cli.flags.bip77 {
             selected_version = Some(Version::Two);
         }
 
         // Check for BIP78 (v1)
-        if cli.flags.bip78.unwrap_or(false) {
+        if cli.flags.bip78 {
             if selected_version.is_some() {
                 return Err(ConfigError::Message(
                     "Multiple version flags specified. Please use only one of: --bip77, --bip78"
@@ -125,8 +130,13 @@ impl Config {
         }
 
         config = handle_subcommands(config, cli)?;
-        config = config.add_source(File::new("config.toml", FileFormat::Toml).required(false));
 
+        if let Some(config_dir) = dirs::config_dir() {
+            let global_config_path = config_dir.join(CONFIG_DIR).join("config.toml");
+            config = config.add_source(File::from(global_config_path).required(false));
+        }
+
+        config = config.add_source(File::new("config.toml", FileFormat::Toml).required(false));
         let built_config = config.build()?;
 
         let mut config = Config {
@@ -134,6 +144,10 @@ impl Config {
             max_fee_rate: built_config.get("max_fee_rate").ok(),
             bitcoind: built_config.get("bitcoind")?,
             version: None,
+            #[cfg(feature = "_manual-tls")]
+            root_certificate: built_config.get("root_certificate").ok(),
+            #[cfg(feature = "_manual-tls")]
+            certificate_key: built_config.get("certificate_key").ok(),
         };
 
         match version {
@@ -141,7 +155,15 @@ impl Config {
                 #[cfg(feature = "v1")]
                 {
                     match built_config.get::<V1Config>("v1") {
-                        Ok(v1) => config.version = Some(VersionConfig::V1(v1)),
+                        Ok(v1) => {
+                            if v1.port == 0 && v1.pj_endpoint.port().is_some() {
+                                return Err(ConfigError::Message(
+                                    "If --port is 0, --pj-endpoint may not have a port".to_owned(),
+                                ));
+                            }
+
+                            config.version = Some(VersionConfig::V1(v1))
+                        }
                         Err(e) =>
                             return Err(ConfigError::Message(format!(
                                 "Valid V1 configuration is required for BIP78 mode: {e}"
@@ -177,7 +199,7 @@ impl Config {
             ));
         }
 
-        log::debug!("App config: {config:?}");
+        tracing::trace!("App config: {config:?}");
         Ok(config)
     }
 
@@ -266,6 +288,18 @@ fn add_v2_defaults(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
 
 /// Handles configuration overrides based on CLI subcommands
 fn handle_subcommands(config: Builder, cli: &Cli) -> Result<Builder, ConfigError> {
+    #[cfg(feature = "_manual-tls")]
+    let config = {
+        config
+            .set_override_option(
+                "root_certificate",
+                Some(cli.root_certificate.as_ref().map(|s| s.to_string_lossy().into_owned())),
+            )?
+            .set_override_option(
+                "certificate_key",
+                Some(cli.certificate_key.as_ref().map(|s| s.to_string_lossy().into_owned())),
+            )?
+    };
     match &cli.command {
         Commands::Send { .. } => Ok(config),
         Commands::Receive {
@@ -282,10 +316,16 @@ fn handle_subcommands(config: Builder, cli: &Cli) -> Result<Builder, ConfigError
             #[cfg(feature = "v1")]
             let config = config
                 .set_override_option("v1.port", port.map(|p| p.to_string()))?
-                .set_override_option("v1.pj_endpoint", pj_endpoint.as_ref().map(|s| s.as_str()))?;
+                .set_override_option(
+                    "v1.pj_endpoint",
+                    pj_endpoint.clone().map(|s| s.to_string()),
+                )?;
             #[cfg(feature = "v2")]
             let config = config
-                .set_override_option("v2.pj_directory", pj_directory.as_ref().map(|s| s.as_str()))?
+                .set_override_option(
+                    "v2.pj_directory",
+                    pj_directory.clone().map(|s| s.to_string()),
+                )?
                 .set_override_option(
                     "v2.ohttp_keys",
                     ohttp_keys.as_ref().map(|s| s.to_string_lossy().into_owned()),
@@ -294,6 +334,10 @@ fn handle_subcommands(config: Builder, cli: &Cli) -> Result<Builder, ConfigError
         }
         #[cfg(feature = "v2")]
         Commands::Resume => Ok(config),
+        #[cfg(feature = "v2")]
+        Commands::History => Ok(config),
+        #[cfg(feature = "v2")]
+        Commands::Cancel { .. } => Ok(config),
     }
 }
 
@@ -316,5 +360,52 @@ where
                 })
             })
             .map(Some),
+    }
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::cli::Cli;
+
+    fn cli(port: &str, endpoint: &str) -> Cli {
+        Cli::parse_from([
+            "payjoin-cli",
+            "--bip78",
+            "--port",
+            port,
+            "--pj-endpoint",
+            endpoint,
+            "receive",
+            "50000",
+        ])
+    }
+
+    #[test]
+    fn rejects_random_port_with_explicit_endpoint_port() {
+        let err = Config::new(&cli("0", "https://example.com:443/")).unwrap_err();
+        assert!(err.to_string().contains("port"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_random_port_with_implicit_endpoint_port() {
+        Config::new(&cli("0", "https://example.com/")).unwrap();
+    }
+
+    #[test]
+    fn accepts_explicit_port_with_implicit_endpoint_port() {
+        Config::new(&cli("3000", "https://example.com/")).unwrap();
+    }
+
+    #[test]
+    fn accepts_explicit_port_with_matching_explicit_endpoint_port() {
+        Config::new(&cli("3000", "https://example.com:3000/")).unwrap();
+    }
+
+    #[test]
+    fn accepts_explicit_port_with_different_explicit_endpoint_port() {
+        Config::new(&cli("3000", "https://example.com:443/")).unwrap();
     }
 }

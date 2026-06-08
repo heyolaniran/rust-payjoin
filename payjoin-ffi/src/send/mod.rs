@@ -1,90 +1,324 @@
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use bitcoin_ffi::Psbt;
-pub use error::{BuildSenderError, CreateRequestError, EncapsulationError, ResponseError};
-use payjoin::persist::SessionPersister;
+pub use error::{
+    BuildSenderError, CreateRequestError, DecapsulationError, PsbtParseError, ResponseError,
+    SenderInputError,
+};
 
+use crate::error::ForeignError;
 pub use crate::error::{ImplementationError, SerdeJsonError};
 use crate::ohttp::ClientResponse;
 use crate::request::Request;
 use crate::send::error::{SenderPersistedError, SenderReplayError};
 use crate::uri::PjUri;
+use crate::validation::{validate_amount_sat, validate_fee_rate_sat_per_kwu};
 
 pub mod error;
-#[cfg(feature = "uniffi")]
-pub mod uni;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SessionEvent(payjoin::send::v2::SessionEvent);
+macro_rules! impl_save_for_transition {
+    ($ty:ident, $next_state:ident) => {
+        #[uniffi::export]
+        impl $ty {
+            pub fn save(
+                &self,
+                persister: Arc<dyn JsonSenderSessionPersister>,
+            ) -> Result<$next_state, SenderPersistedError> {
+                let adapter = CallbackPersisterAdapter::new(persister);
+                let mut inner = self.0.write().expect("Lock should not be poisoned");
 
-impl From<SessionEvent> for payjoin::send::v2::SessionEvent {
-    fn from(value: SessionEvent) -> Self { value.0 }
+                let value = inner.take().expect("Already saved or moved");
+
+                let res = value.save(&adapter).map_err(SenderPersistedError::from)?;
+                Ok(res.into())
+            }
+
+            pub async fn save_async(
+                &self,
+                persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+            ) -> Result<$next_state, SenderPersistedError> {
+                let adapter = AsyncCallbackPersisterAdapter::new(persister);
+                // Extract value while holding the lock, then drop the guard before await
+                let value = {
+                    let mut inner = self.0.write().expect("Lock should not be poisoned");
+                    inner.take().expect("Already saved or moved")
+                };
+
+                let res = value.save_async(&adapter).await.map_err(SenderPersistedError::from)?;
+                Ok(res.into())
+            }
+        }
+    };
 }
 
-impl From<payjoin::send::v2::SessionEvent> for SessionEvent {
-    fn from(value: payjoin::send::v2::SessionEvent) -> Self { SessionEvent(value) }
-}
-
-#[derive(Debug, Clone)]
-pub struct SendSession(pub payjoin::send::v2::SendSession);
-
-impl From<payjoin::send::v2::SendSession> for SendSession {
-    fn from(value: payjoin::send::v2::SendSession) -> Self { Self(value) }
-}
-
-pub fn replay_event_log<P>(
-    persister: &P,
-) -> Result<(SendSession, SessionHistory), SenderReplayError>
-where
-    P: SessionPersister + Clone,
-    P::SessionEvent: Into<payjoin::send::v2::SessionEvent> + Clone,
-{
-    let (state, history) =
-        payjoin::send::v2::replay_event_log(persister).map_err(SenderReplayError::from)?;
-    Ok((state.into(), history.into()))
-}
-
-#[derive(Default, Clone)]
-pub struct SessionHistory(pub payjoin::send::v2::SessionHistory);
-
-impl From<payjoin::send::v2::SessionHistory> for SessionHistory {
-    fn from(value: payjoin::send::v2::SessionHistory) -> Self { Self(value) }
-}
-
+#[derive(uniffi::Object)]
 #[allow(clippy::type_complexity)]
-pub struct InitInputsTransition(
+pub struct SenderCancelTransition(
     Arc<
         RwLock<
             Option<
-                payjoin::persist::MaybeBadInitInputsTransition<
+                payjoin::persist::NextStateTransition<
                     payjoin::send::v2::SessionEvent,
-                    payjoin::send::v2::Sender<payjoin::send::v2::WithReplyKey>,
-                    payjoin::send::BuildSenderError,
+                    payjoin::send::v2::Sender<payjoin::send::v2::PendingFallback>,
                 >,
             >,
         >,
     >,
 );
 
-impl InitInputsTransition {
-    pub fn save<P>(&self, persister: &P) -> Result<WithReplyKey, SenderPersistedError>
-    where
-        P: SessionPersister<SessionEvent = payjoin::send::v2::SessionEvent>,
-    {
-        let mut inner = self.0.write().map_err(|_| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Lock poisoned".to_string(),
-            )))
-        })?;
+#[uniffi::export]
+impl SenderCancelTransition {
+    pub fn save(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersister>,
+    ) -> Result<SenderPendingFallback, SenderPersistedError> {
+        let adapter = CallbackPersisterAdapter::new(persister);
+        let mut inner = self.0.write().expect("Lock should not be poisoned");
+        let value = inner.take().expect("Already saved or moved");
+        let res = value
+            .save(&adapter)
+            .map_err(|e| SenderPersistedError::from(ImplementationError::new(e)))?;
+        Ok(res.into())
+    }
 
-        let value = inner.take().ok_or_else(|| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Already saved or moved".to_string(),
-            )))
-        })?;
+    pub async fn save_async(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+    ) -> Result<SenderPendingFallback, SenderPersistedError> {
+        let adapter = AsyncCallbackPersisterAdapter::new(persister);
+        let value = {
+            let mut inner = self.0.write().expect("Lock should not be poisoned");
+            inner.take().expect("Already saved or moved")
+        };
+        let res = value
+            .save_async(&adapter)
+            .await
+            .map_err(|e| SenderPersistedError::from(ImplementationError::new(e)))?;
+        Ok(res.into())
+    }
+}
 
-        let res = value.save(persister).map_err(SenderPersistedError::from)?;
+macro_rules! impl_cancel_for_sender {
+    ($ty:ident) => {
+        #[uniffi::export]
+        impl $ty {
+            /// Cancel the Payjoin session immediately.
+            ///
+            /// Returns a [`SenderCancelTransition`] that, once persisted, yields a
+            /// [`SenderPendingFallback`] state. Call [`SenderPendingFallback::fallback_tx`] to get
+            /// the original transaction
+            pub fn cancel(&self) -> SenderCancelTransition {
+                let transition = self.0.clone().cancel();
+                SenderCancelTransition(Arc::new(RwLock::new(Some(transition))))
+            }
+        }
+    };
+}
+
+impl_cancel_for_sender!(WithReplyKey);
+impl_cancel_for_sender!(PollingForProposal);
+
+#[derive(uniffi::Object, Debug, Clone)]
+pub struct SenderSessionEvent(payjoin::send::v2::SessionEvent);
+
+impl From<SenderSessionEvent> for payjoin::send::v2::SessionEvent {
+    fn from(value: SenderSessionEvent) -> Self { value.0 }
+}
+
+impl From<payjoin::send::v2::SessionEvent> for SenderSessionEvent {
+    fn from(value: payjoin::send::v2::SessionEvent) -> Self { SenderSessionEvent(value) }
+}
+
+#[uniffi::export]
+impl SenderSessionEvent {
+    pub fn to_json(&self) -> Result<String, SerdeJsonError> {
+        serde_json::to_string(&self.0).map_err(Into::into)
+    }
+
+    #[uniffi::constructor]
+    pub fn from_json(json: String) -> Result<Self, SerdeJsonError> {
+        let event: payjoin::send::v2::SessionEvent = serde_json::from_str(&json)?;
+        Ok(SenderSessionEvent(event))
+    }
+}
+
+#[derive(Clone, uniffi::Object)]
+pub struct SenderSessionOutcome(payjoin::send::v2::SessionOutcome);
+
+impl From<payjoin::send::v2::SessionOutcome> for SenderSessionOutcome {
+    fn from(value: payjoin::send::v2::SessionOutcome) -> Self { Self(value) }
+}
+
+impl From<SenderSessionOutcome> for payjoin::send::v2::SessionOutcome {
+    fn from(value: SenderSessionOutcome) -> Self { value.0 }
+}
+
+#[uniffi::export]
+impl SenderSessionOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self.0, payjoin::send::v2::SessionOutcome::Success(_))
+    }
+
+    pub fn success_psbt_base64(&self) -> Option<String> {
+        match &self.0 {
+            payjoin::send::v2::SessionOutcome::Success(psbt) => Some(psbt.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        matches!(self.0, payjoin::send::v2::SessionOutcome::Aborted)
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum SendSession {
+    WithReplyKey { inner: Arc<WithReplyKey> },
+    PollingForProposal { inner: Arc<PollingForProposal> },
+    SenderPendingFallback { inner: Arc<SenderPendingFallback> },
+    Closed { inner: Arc<SenderSessionOutcome> },
+}
+
+impl From<payjoin::send::v2::SendSession> for SendSession {
+    fn from(value: payjoin::send::v2::SendSession) -> Self {
+        use payjoin::send::v2::SendSession;
+        match value {
+            SendSession::WithReplyKey(inner) =>
+                Self::WithReplyKey { inner: Arc::new(inner.into()) },
+            SendSession::PollingForProposal(inner) =>
+                Self::PollingForProposal { inner: Arc::new(inner.into()) },
+            SendSession::PendingFallback(inner) =>
+                Self::SenderPendingFallback { inner: Arc::new(inner.into()) },
+            SendSession::Closed(session_outcome) =>
+                Self::Closed { inner: Arc::new(session_outcome.into()) },
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct SenderReplayResult {
+    state: SendSession,
+    session_history: SenderSessionHistory,
+}
+
+#[uniffi::export]
+impl SenderReplayResult {
+    pub fn state(&self) -> SendSession { self.state.clone() }
+
+    pub fn session_history(&self) -> SenderSessionHistory { self.session_history.clone() }
+}
+
+#[uniffi::export]
+pub fn replay_sender_event_log(
+    persister: Arc<dyn JsonSenderSessionPersister>,
+) -> Result<SenderReplayResult, SenderReplayError> {
+    let adapter = CallbackPersisterAdapter::new(persister);
+    let (state, session_history) = payjoin::send::v2::replay_event_log(&adapter)?;
+    Ok(SenderReplayResult { state: state.into(), session_history: session_history.into() })
+}
+
+#[uniffi::export]
+pub async fn replay_sender_event_log_async(
+    persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+) -> Result<SenderReplayResult, SenderReplayError> {
+    let adapter = AsyncCallbackPersisterAdapter::new(persister);
+    let (state, session_history) = payjoin::send::v2::replay_event_log_async(&adapter).await?;
+    Ok(SenderReplayResult { state: state.into(), session_history: session_history.into() })
+}
+
+/// Represents the status of a session that can be inferred from the information in the session
+/// event log.
+#[derive(uniffi::Object)]
+pub struct SenderSessionStatus {
+    inner: payjoin::send::v2::SessionStatus,
+}
+
+impl From<payjoin::send::v2::SessionStatus> for SenderSessionStatus {
+    fn from(value: payjoin::send::v2::SessionStatus) -> Self { Self { inner: value } }
+}
+
+impl From<SenderSessionStatus> for payjoin::send::v2::SessionStatus {
+    fn from(value: SenderSessionStatus) -> Self { value.inner }
+}
+
+#[derive(uniffi::Object)]
+pub struct PjParam(payjoin::uri::v2::PjParam);
+
+impl From<payjoin::uri::v2::PjParam> for PjParam {
+    fn from(value: payjoin::uri::v2::PjParam) -> Self { Self(value) }
+}
+
+impl From<PjParam> for payjoin::uri::v2::PjParam {
+    fn from(value: PjParam) -> Self { value.0 }
+}
+
+#[derive(uniffi::Object, Clone)]
+pub struct SenderSessionHistory(pub payjoin::send::v2::SessionHistory);
+
+impl From<payjoin::send::v2::SessionHistory> for SenderSessionHistory {
+    fn from(value: payjoin::send::v2::SessionHistory) -> Self { Self(value) }
+}
+
+impl From<SenderSessionHistory> for payjoin::send::v2::SessionHistory {
+    fn from(value: SenderSessionHistory) -> Self { value.0 }
+}
+
+#[uniffi::export]
+impl SenderSessionHistory {
+    /// Fallback transaction from the session if present
+    pub fn fallback_tx(&self) -> Vec<u8> {
+        payjoin::bitcoin::consensus::encode::serialize(&self.0.fallback_tx())
+    }
+
+    pub fn pj_param(&self) -> Arc<PjParam> { Arc::new(self.0.pj_param().to_owned().into()) }
+
+    pub fn status(&self) -> SenderSessionStatus { self.0.status().into() }
+}
+
+#[derive(uniffi::Object)]
+#[allow(clippy::type_complexity)]
+pub struct InitialSendTransition(
+    Arc<
+        RwLock<
+            Option<
+                payjoin::persist::NextStateTransition<
+                    payjoin::send::v2::SessionEvent,
+                    payjoin::send::v2::Sender<payjoin::send::v2::WithReplyKey>,
+                >,
+            >,
+        >,
+    >,
+);
+
+#[uniffi::export]
+impl InitialSendTransition {
+    pub fn save(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersister>,
+    ) -> Result<WithReplyKey, ForeignError> {
+        let adapter = CallbackPersisterAdapter::new(persister);
+        let mut inner = self.0.write().expect("Lock should not be poisoned");
+
+        let value = inner.take().expect("Already saved or moved");
+
+        let res = value.save(&adapter).map_err(|e| ForeignError::InternalError(e.to_string()))?;
+        Ok(res.into())
+    }
+
+    pub async fn save_async(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+    ) -> Result<WithReplyKey, ForeignError> {
+        let adapter = AsyncCallbackPersisterAdapter::new(persister);
+        let value = {
+            let mut inner = self.0.write().expect("Lock should not be poisoned");
+            inner.take().expect("Already saved or moved")
+        };
+
+        let res = value
+            .save_async(&adapter)
+            .await
+            .map_err(|e| ForeignError::InternalError(e.to_string()))?;
         Ok(res.into())
     }
 }
@@ -92,21 +326,26 @@ impl InitInputsTransition {
 ///Builder for sender-side payjoin parameters
 ///
 ///These parameters define how client wants to handle Payjoin.
-#[derive(Clone)]
-pub struct SenderBuilder(payjoin::send::v2::SenderBuilder<'static>);
+#[derive(Clone, uniffi::Object)]
+pub struct SenderBuilder(payjoin::send::v2::SenderBuilder);
 
-impl From<payjoin::send::v2::SenderBuilder<'static>> for SenderBuilder {
-    fn from(value: payjoin::send::v2::SenderBuilder<'static>) -> Self { Self(value) }
+impl From<payjoin::send::v2::SenderBuilder> for SenderBuilder {
+    fn from(value: payjoin::send::v2::SenderBuilder) -> Self { Self(value) }
 }
 
+#[uniffi::export]
 impl SenderBuilder {
     /// Prepare an HTTP request and request context to process the response
     ///
     /// Call [`SenderBuilder::build_recommended()`] or other `build` methods
     /// to create a [`WithReplyKey`]
-    pub fn new(psbt: String, uri: PjUri) -> Result<Self, BuildSenderError> {
-        let psbt = payjoin::bitcoin::psbt::Psbt::from_str(psbt.as_str())?;
-        Ok(payjoin::send::v2::SenderBuilder::new(psbt, uri.into()).into())
+    #[uniffi::constructor]
+    pub fn new(psbt: String, uri: Arc<PjUri>) -> Result<Self, SenderInputError> {
+        let psbt = payjoin::bitcoin::psbt::Psbt::from_str(psbt.as_str())
+            .map_err(PsbtParseError::from)
+            .map_err(SenderInputError::Psbt)?;
+        let builder = payjoin::send::v2::SenderBuilder::new(psbt, Arc::unwrap_or_clone(uri).into());
+        Ok(builder.into())
     }
 
     /// Disable output substitution even if the receiver didn't.
@@ -124,16 +363,22 @@ impl SenderBuilder {
     // The minfeerate parameter is set if the contribution is available in change.
     //
     // This method fails if no recommendation can be made or if the PSBT is malformed.
-    pub fn build_recommended(&self, min_fee_rate: u64) -> InitInputsTransition {
-        InitInputsTransition(Arc::new(RwLock::new(Some(
-            self.0
-                .clone()
-                .build_recommended(payjoin::bitcoin::FeeRate::from_sat_per_kwu(min_fee_rate)),
-        ))))
+    pub fn build_recommended(
+        &self,
+        min_fee_rate_sat_per_kwu: u64,
+    ) -> Result<InitialSendTransition, SenderInputError> {
+        let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
+        self.0
+            .clone()
+            .build_recommended(fee_rate)
+            .map(|transition| InitialSendTransition(Arc::new(RwLock::new(Some(transition)))))
+            .map_err(|e: payjoin::send::BuildSenderError| {
+                SenderInputError::Build(Arc::new(e.into()))
+            })
     }
     /// Offer the receiver contribution to pay for his input.
     ///
-    /// These parameters will allow the receiver to take `max_fee_contribution` from given change
+    /// These parameters will allow the receiver to take `max_fee_contribution_sats` from given change
     /// output to pay for additional inputs. The recommended fee is `size_of_one_input * fee_rate`.
     ///
     /// `change_index` specifies which output can be used to pay fee. If `None` is provided, then
@@ -146,32 +391,46 @@ impl SenderBuilder {
     /// be just lowered in the request to match the change amount.
     pub fn build_with_additional_fee(
         &self,
-        max_fee_contribution: u64,
+        max_fee_contribution_sats: u64,
         change_index: Option<u8>,
-        min_fee_rate: u64,
+        min_fee_rate_sat_per_kwu: u64,
         clamp_fee_contribution: bool,
-    ) -> InitInputsTransition {
-        InitInputsTransition(Arc::new(RwLock::new(Some(self.0.clone().build_with_additional_fee(
-            payjoin::bitcoin::Amount::from_sat(max_fee_contribution),
-            change_index.map(|x| x as usize),
-            payjoin::bitcoin::FeeRate::from_sat_per_kwu(min_fee_rate),
-            clamp_fee_contribution,
-        )))))
+    ) -> Result<InitialSendTransition, SenderInputError> {
+        let max_fee_contribution = validate_amount_sat(max_fee_contribution_sats)?;
+        let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
+        self.0
+            .clone()
+            .build_with_additional_fee(
+                max_fee_contribution,
+                change_index.map(|x| x as usize),
+                fee_rate,
+                clamp_fee_contribution,
+            )
+            .map(|transition| InitialSendTransition(Arc::new(RwLock::new(Some(transition)))))
+            .map_err(|e: payjoin::send::BuildSenderError| {
+                SenderInputError::Build(Arc::new(e.into()))
+            })
     }
     /// Perform Payjoin without incentivizing the payee to cooperate.
     ///
     /// While it's generally better to offer some contribution some users may wish not to.
     /// This function disables contribution.
-    pub fn build_non_incentivizing(&self, min_fee_rate: u64) -> InitInputsTransition {
-        InitInputsTransition(Arc::new(RwLock::new(Some(
-            self.0
-                .clone()
-                .build_non_incentivizing(payjoin::bitcoin::FeeRate::from_sat_per_kwu(min_fee_rate)),
-        ))))
+    pub fn build_non_incentivizing(
+        &self,
+        min_fee_rate_sat_per_kwu: u64,
+    ) -> Result<InitialSendTransition, SenderInputError> {
+        let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
+        self.0
+            .clone()
+            .build_non_incentivizing(fee_rate)
+            .map(|transition| InitialSendTransition(Arc::new(RwLock::new(Some(transition)))))
+            .map_err(|e: payjoin::send::BuildSenderError| {
+                SenderInputError::Build(Arc::new(e.into()))
+            })
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, uniffi::Object)]
 pub struct WithReplyKey(payjoin::send::v2::Sender<payjoin::send::v2::WithReplyKey>);
 
 impl From<payjoin::send::v2::Sender<payjoin::send::v2::WithReplyKey>> for WithReplyKey {
@@ -184,6 +443,7 @@ impl From<WithReplyKey> for payjoin::send::v2::Sender<payjoin::send::v2::WithRep
     fn from(value: WithReplyKey) -> Self { value.0 }
 }
 
+#[derive(uniffi::Object)]
 #[allow(clippy::type_complexity)]
 pub struct WithReplyKeyTransition(
     Arc<
@@ -191,42 +451,46 @@ pub struct WithReplyKeyTransition(
             Option<
                 payjoin::persist::MaybeFatalTransition<
                     payjoin::send::v2::SessionEvent,
-                    payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>,
-                    payjoin::send::v2::EncapsulationError,
+                    payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
+                    payjoin::send::v2::DecapsulationError,
                 >,
             >,
         >,
     >,
 );
 
+#[uniffi::export]
 impl WithReplyKeyTransition {
-    pub fn save<P>(&self, persister: &P) -> Result<V2GetContext, SenderPersistedError>
-    where
-        P: SessionPersister<SessionEvent = payjoin::send::v2::SessionEvent>,
-    {
-        let mut inner = self.0.write().map_err(|_| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Lock poisoned".to_string(),
-            )))
-        })?;
+    pub fn save(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersister>,
+    ) -> Result<PollingForProposal, SenderPersistedError> {
+        let adapter = CallbackPersisterAdapter::new(persister);
+        let mut inner = self.0.write().expect("Lock should not be poisoned");
 
-        let value = inner.take().ok_or_else(|| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Already saved or moved".to_string(),
-            )))
-        })?;
+        let value = inner.take().expect("Already saved or moved");
 
-        let res = value.save(persister).map_err(SenderPersistedError::from)?;
+        let res = value.save(&adapter).map_err(SenderPersistedError::from)?;
+        Ok(res.into())
+    }
+
+    pub async fn save_async(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+    ) -> Result<PollingForProposal, SenderPersistedError> {
+        let adapter = AsyncCallbackPersisterAdapter::new(persister);
+        let value = {
+            let mut inner = self.0.write().expect("Lock should not be poisoned");
+            inner.take().expect("Already saved or moved")
+        };
+
+        let res = value.save_async(&adapter).await.map_err(SenderPersistedError::from)?;
         Ok(res.into())
     }
 }
 
+#[uniffi::export]
 impl WithReplyKey {
-    pub fn create_v1_post_request(&self) -> (Request, V1Context) {
-        let (req, ctx) = self.0.clone().create_v1_post_request();
-        (req.into(), ctx.into())
-    }
-
     /// Construct serialized Request and Context from a Payjoin Proposal.
     ///
     /// Important: This request must not be retried or reused on failure.
@@ -235,9 +499,10 @@ impl WithReplyKey {
     pub fn create_v2_post_request(
         &self,
         ohttp_relay: String,
-    ) -> Result<(Request, V2PostContext), CreateRequestError> {
+    ) -> Result<RequestOhttpContext, CreateRequestError> {
         match self.0.create_v2_post_request(ohttp_relay) {
-            Ok((req, ctx)) => Ok((req.into(), ctx.into())),
+            Ok((req, ctx)) =>
+                Ok(RequestOhttpContext { request: req.into(), ohttp_ctx: Arc::new(ctx.into()) }),
             Err(e) => Err(e.into()),
         }
     }
@@ -248,22 +513,29 @@ impl WithReplyKey {
     pub fn process_response(
         &self,
         response: &[u8],
-        post_ctx: V2PostContext,
+        post_ctx: &ClientResponse,
     ) -> WithReplyKeyTransition {
         WithReplyKeyTransition(Arc::new(RwLock::new(Some(
-            self.clone().0.process_response(response, post_ctx.into()),
+            self.0.clone().process_response(response, post_ctx.into()),
         ))))
     }
 }
 
+#[derive(uniffi::Record)]
+pub struct RequestV1Context {
+    pub request: Request,
+    pub context: Arc<V1Context>,
+}
+
 /// Data required for validation of response.
 /// This type is used to process the response. Get it from SenderBuilder's build methods. Then you only need to call .process_response() on it to continue BIP78 flow.
-#[derive(Clone)]
+#[derive(Clone, uniffi::Object)]
 pub struct V1Context(Arc<payjoin::send::v1::V1Context>);
 impl From<payjoin::send::v1::V1Context> for V1Context {
     fn from(value: payjoin::send::v1::V1Context) -> Self { Self(Arc::new(value)) }
 }
 
+#[uniffi::export]
 impl V1Context {
     ///Decodes and validates the response.
     /// Call this method with response from receiver to continue BIP78 flow. If the response is valid you will get appropriate PSBT that you should sign and broadcast.
@@ -275,66 +547,60 @@ impl V1Context {
     }
 }
 
-pub struct V2PostContext(payjoin::send::v2::V2PostContext);
-
-impl From<V2PostContext> for payjoin::send::v2::V2PostContext {
-    fn from(value: V2PostContext) -> Self { value.0 }
+#[derive(uniffi::Record)]
+pub struct RequestOhttpContext {
+    pub request: crate::Request,
+    pub ohttp_ctx: Arc<crate::ClientResponse>,
 }
 
-impl From<payjoin::send::v2::V2PostContext> for V2PostContext {
-    fn from(value: payjoin::send::v2::V2PostContext) -> Self { Self(value) }
-}
+#[derive(uniffi::Object)]
+pub struct PollingForProposal(payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>);
 
-pub struct V2GetContext(payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>);
-
-impl From<payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>> for V2GetContext {
-    fn from(value: payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>) -> Self {
+impl From<payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>> for PollingForProposal {
+    fn from(value: payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>) -> Self {
         Self(value)
     }
 }
 
-pub struct V2GetContextTransitionOutcome(
-    payjoin::persist::OptionalTransitionOutcome<
-        payjoin::bitcoin::Psbt,
-        payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>,
-    >,
-);
-
-impl V2GetContextTransitionOutcome {
-    pub fn is_none(&self) -> bool { self.0.is_none() }
-
-    pub fn is_success(&self) -> bool { self.0.is_success() }
-
-    pub fn success(&self) -> Option<Psbt> { self.0.success().map(|r| r.clone().into()) }
+#[derive(uniffi::Enum)]
+pub enum PollingForProposalTransitionOutcome {
+    Progress { psbt_base64: String },
+    Stasis { inner: Arc<PollingForProposal> },
 }
 
 impl
     From<
         payjoin::persist::OptionalTransitionOutcome<
             payjoin::bitcoin::Psbt,
-            payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>,
+            payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
         >,
-    > for V2GetContextTransitionOutcome
+    > for PollingForProposalTransitionOutcome
 {
     fn from(
         value: payjoin::persist::OptionalTransitionOutcome<
             payjoin::bitcoin::Psbt,
-            payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>,
+            payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
         >,
     ) -> Self {
-        Self(value)
+        match value {
+            payjoin::persist::OptionalTransitionOutcome::Progress(psbt) =>
+                Self::Progress { psbt_base64: psbt.to_string() },
+            payjoin::persist::OptionalTransitionOutcome::Stasis(state) =>
+                Self::Stasis { inner: Arc::new(state.into()) },
+        }
     }
 }
 
+#[derive(uniffi::Object)]
 #[allow(clippy::type_complexity)]
-pub struct V2GetContextTransition(
+pub struct PollingForProposalTransition(
     Arc<
         RwLock<
             Option<
                 payjoin::persist::MaybeSuccessTransitionWithNoResults<
                     payjoin::send::v2::SessionEvent,
                     payjoin::bitcoin::Psbt,
-                    payjoin::send::v2::Sender<payjoin::send::v2::V2GetContext>,
+                    payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
                     payjoin::send::ResponseError,
                 >,
             >,
@@ -342,39 +608,20 @@ pub struct V2GetContextTransition(
     >,
 );
 
-impl V2GetContextTransition {
-    pub fn save<P>(
-        &self,
-        persister: &P,
-    ) -> Result<V2GetContextTransitionOutcome, SenderPersistedError>
-    where
-        P: SessionPersister<SessionEvent = payjoin::send::v2::SessionEvent>,
-    {
-        let mut inner = self.0.write().map_err(|_| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Lock poisoned".to_string(),
-            )))
-        })?;
+impl_save_for_transition!(PollingForProposalTransition, PollingForProposalTransitionOutcome);
 
-        let value = inner.take().ok_or_else(|| {
-            SenderPersistedError::Storage(Arc::new(ImplementationError::from(
-                "Already saved or moved".to_string(),
-            )))
-        })?;
-
-        let res = value.save(persister).map_err(SenderPersistedError::from)?;
-        Ok(res.into())
-    }
-}
-
-impl V2GetContext {
+#[uniffi::export]
+impl PollingForProposal {
     pub fn create_poll_request(
         &self,
         ohttp_relay: String,
-    ) -> Result<(Request, ClientResponse), CreateRequestError> {
+    ) -> Result<RequestOhttpContext, CreateRequestError> {
         self.0
             .create_poll_request(ohttp_relay)
-            .map(|(req, ctx)| (req.into(), ctx.into()))
+            .map(|(req, ctx)| RequestOhttpContext {
+                request: req.into(),
+                ohttp_ctx: Arc::new(ctx.into()),
+            })
             .map_err(|e| e.into())
     }
 
@@ -385,9 +632,188 @@ impl V2GetContext {
         &self,
         response: &[u8],
         ohttp_ctx: &ClientResponse,
-    ) -> V2GetContextTransition {
-        V2GetContextTransition(Arc::new(RwLock::new(Some(
-            self.0.process_response(response, ohttp_ctx.into()),
+    ) -> PollingForProposalTransition {
+        PollingForProposalTransition(Arc::new(RwLock::new(Some(
+            self.0.clone().process_response(response, ohttp_ctx.into()),
         ))))
+    }
+}
+
+#[derive(Clone, uniffi::Object)]
+pub struct SenderPendingFallback(payjoin::send::v2::Sender<payjoin::send::v2::PendingFallback>);
+
+impl From<payjoin::send::v2::Sender<payjoin::send::v2::PendingFallback>> for SenderPendingFallback {
+    fn from(value: payjoin::send::v2::Sender<payjoin::send::v2::PendingFallback>) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(uniffi::Object)]
+#[allow(clippy::type_complexity)]
+pub struct BroadcastedTransition(
+    Arc<RwLock<Option<payjoin::persist::TerminalTransition<payjoin::send::v2::SessionEvent, ()>>>>,
+);
+
+#[uniffi::export]
+impl BroadcastedTransition {
+    pub fn save(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersister>,
+    ) -> Result<(), SenderPersistedError> {
+        let adapter = CallbackPersisterAdapter::new(persister);
+        let mut inner = self.0.write().expect("Lock should not be poisoned");
+        let value = inner.take().expect("Already saved or moved");
+        value.save(&adapter).map_err(|e| SenderPersistedError::from(ImplementationError::new(e)))
+    }
+
+    pub async fn save_async(
+        &self,
+        persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+    ) -> Result<(), SenderPersistedError> {
+        let adapter = AsyncCallbackPersisterAdapter::new(persister);
+        let value = {
+            let mut inner = self.0.write().expect("Lock should not be poisoned");
+            inner.take().expect("Already saved or moved")
+        };
+        value
+            .save_async(&adapter)
+            .await
+            .map_err(|e| SenderPersistedError::from(ImplementationError::new(e)))
+    }
+}
+
+#[uniffi::export]
+impl SenderPendingFallback {
+    /// Returns the fallback transaction as consensus-encoded raw bytes.
+    ///
+    /// This is the sender's original transaction that should be broadcast to
+    /// complete the payment without Payjoin.
+    pub fn fallback_tx(&self) -> Vec<u8> {
+        payjoin::bitcoin::consensus::serialize(self.0.fallback_tx())
+    }
+
+    /// Mark the session as complete, signaling that the fallback transaction
+    /// has been broadcast or its control has been transferred.
+    ///
+    /// Persist the returned [`BroadcastedTransition`] to close the session.
+    pub fn close(&self) -> BroadcastedTransition {
+        BroadcastedTransition(Arc::new(RwLock::new(Some(self.0.close()))))
+    }
+}
+
+/// Session persister that should save and load events as JSON strings.
+#[uniffi::export(with_foreign)]
+pub trait JsonSenderSessionPersister: Send + Sync {
+    fn save(&self, event: String) -> Result<(), ForeignError>;
+    fn load(&self) -> Result<Vec<String>, ForeignError>;
+    fn close(&self) -> Result<(), ForeignError>;
+}
+
+// The adapter to use the save and load callbacks
+#[derive(Clone)]
+struct CallbackPersisterAdapter {
+    callback_persister: Arc<dyn JsonSenderSessionPersister>,
+}
+
+impl CallbackPersisterAdapter {
+    pub fn new(callback_persister: Arc<dyn JsonSenderSessionPersister>) -> Self {
+        Self { callback_persister }
+    }
+}
+
+// Implement the Persister trait for the adapter
+impl payjoin::persist::SessionPersister for CallbackPersisterAdapter {
+    type SessionEvent = payjoin::send::v2::SessionEvent;
+    type InternalStorageError = ForeignError;
+
+    fn save_event(&self, event: Self::SessionEvent) -> Result<(), Self::InternalStorageError> {
+        let event: SenderSessionEvent = event.into();
+        self.callback_persister
+            .save(event.to_json().map_err(|e| ForeignError::InternalError(e.to_string()))?)
+    }
+
+    fn load(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Self::SessionEvent>>, Self::InternalStorageError> {
+        let res = self.callback_persister.load()?;
+        let events = res
+            .into_iter()
+            .map(|event| {
+                SenderSessionEvent::from_json(event)
+                    .map_err(|e| ForeignError::InternalError(e.to_string()))
+                    .map(|e| e.into())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Box::new(events.into_iter()))
+    }
+
+    fn close(&self) -> Result<(), Self::InternalStorageError> { self.callback_persister.close() }
+}
+
+/// Async session persister that should save and load events as JSON strings.
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait JsonSenderSessionPersisterAsync: Send + Sync {
+    async fn save(&self, event: String) -> Result<(), ForeignError>;
+    async fn load(&self) -> Result<Vec<String>, ForeignError>;
+    async fn close(&self) -> Result<(), ForeignError>;
+}
+
+/// Adapter for the [JsonSenderSessionPersisterAsync] trait to use the save and load callbacks.
+struct AsyncCallbackPersisterAdapter {
+    callback_persister: Arc<dyn JsonSenderSessionPersisterAsync>,
+}
+
+impl AsyncCallbackPersisterAdapter {
+    pub fn new(callback_persister: Arc<dyn JsonSenderSessionPersisterAsync>) -> Self {
+        Self { callback_persister }
+    }
+}
+
+impl payjoin::persist::AsyncSessionPersister for AsyncCallbackPersisterAdapter {
+    type SessionEvent = payjoin::send::v2::SessionEvent;
+    type InternalStorageError = ForeignError;
+
+    fn save_event(
+        &self,
+        event: Self::SessionEvent,
+    ) -> impl std::future::Future<Output = Result<(), Self::InternalStorageError>> + Send {
+        let uni_event: SenderSessionEvent = event.into();
+        let persister = self.callback_persister.clone();
+        async move {
+            let json =
+                uni_event.to_json().map_err(|e| ForeignError::InternalError(e.to_string()))?;
+            persister.save(json).await
+        }
+    }
+
+    fn load(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<
+            Box<dyn Iterator<Item = Self::SessionEvent> + Send>,
+            Self::InternalStorageError,
+        >,
+    > + Send {
+        let persister = self.callback_persister.clone();
+        async move {
+            let res = persister.load().await?;
+            let events: Vec<_> = res
+                .into_iter()
+                .map(|event| {
+                    SenderSessionEvent::from_json(event)
+                        .map_err(|e| ForeignError::InternalError(e.to_string()))
+                        .map(Into::into)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Box::new(events.into_iter()) as Box<dyn Iterator<Item = _> + Send>)
+        }
+    }
+
+    fn close(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), Self::InternalStorageError>> + Send {
+        let persister = self.callback_persister.clone();
+        async move { persister.close().await }
     }
 }

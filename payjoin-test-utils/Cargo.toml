@@ -5,26 +5,49 @@ edition = "2021"
 authors = ["Dan Gould <d@ngould.dev>"]
 description = "Payjoin test utilities"
 repository = "https://github.com/payjoin/rust-payjoin"
-rust-version = "1.63"
+rust-version = "1.85"
 license = "MIT"
 
+[features]
+default = ["v2"]
+v2 = [
+  "payjoin/io",
+  "payjoin/_manual-tls",
+  "dep:axum-server",
+  "dep:ohttp",
+  "dep:rcgen",
+  "dep:rustls",
+  "dep:reqwest",
+  "dep:http",
+  "dep:tempfile",
+]
+
 [dependencies]
-bitcoin = { version = "0.32.5", features = ["base64"] }
-bitcoincore-rpc = "0.19.0"
-bitcoind = { version = "0.36.0", features = ["0_21_2"] }
-http = "1.1.0"
-log = "0.4.7"
-ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
-ohttp-relay = { version = "0.0.10", features = ["_test-util"] }
-once_cell = "1.19.0"
-payjoin = { version = "0.24.0", features = ["io", "_danger-local-https", "_test-utils"] }
-payjoin-directory = { version = "0.0.3", features = ["_danger-local-https"] }
-rcgen = "0.11"
-rustls = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-testcontainers = "0.15.0"
-testcontainers-modules = { version = "0.3.7", features = ["redis"] }
-tokio = { version = "1.38.1", features = ["full"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-url = "2.2.2"
+axum-server = { version = "0.8", features = [
+  "tls-rustls-no-provider",
+], optional = true }
+bitcoin = { version = "0.32.7", features = ["base64"] }
+corepc-node = { version = "0.10.0", features = ["download", "29_0"] }
+http = { version = "1.3.1", optional = true }
+ohttp = { package = "bitcoin-ohttp", version = "0.6.0", optional = true }
+once_cell = "1.21.3"
+payjoin = { version = "1.0.0-rc.3", default-features = false }
+payjoin-mailroom = { version = "0.1.1", features = ["_manual-tls"] }
+# Pin to 0.14.7 (last version to support our MSRV 1.85)
+rcgen = { version = "=0.14.7", optional = true }
+reqwest = { version = "0.12.23", default-features = false, features = [
+  "rustls-tls",
+], optional = true }
+rustls = { version = "0.23.31", default-features = false, features = [
+  "ring",
+], optional = true }
+tempfile = { version = "3.20.0", optional = true }
+# Pin to 0.3.45 (last version to support our MSRV 1.85)
+time = "=0.3.45"
+tokio = { version = "1.47.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# time is a transient dependency, but needs to be specified explicitly to pin the version for MSRV
+[package.metadata.cargo-machete]
+ignored = ["time"]

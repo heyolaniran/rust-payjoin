@@ -1,43 +1,51 @@
+//! OHTTP relay selection and key bootstrapping for the payjoin-cli.
+//!
+//! [`RelayManager`] tracks the currently selected relay and any relays that
+//! have failed, excluding them from future selections for the lifetime of
+//! the [`RelayManager`].
+//!
+//! `fetch_ohttp_keys` selects a relay at random from the configured list,
+//! excluding relays that [`RelayManager`] has marked as failed,
+//! to avoid a fixed contact pattern at the network layer.
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
+use payjoin::Url;
 
 use super::Config;
 
 #[derive(Debug, Clone)]
 pub struct RelayManager {
-    selected_relay: Option<payjoin::Url>,
-    failed_relays: Vec<payjoin::Url>,
+    selected_relay: Option<Url>,
+    failed_relays: Vec<Url>,
 }
 
 impl RelayManager {
     pub fn new() -> Self { RelayManager { selected_relay: None, failed_relays: Vec::new() } }
 
-    pub fn set_selected_relay(&mut self, relay: payjoin::Url) { self.selected_relay = Some(relay); }
+    pub fn set_selected_relay(&mut self, relay: Url) { self.selected_relay = Some(relay); }
 
-    pub fn get_selected_relay(&self) -> Option<payjoin::Url> { self.selected_relay.clone() }
+    pub fn get_selected_relay(&self) -> Option<Url> { self.selected_relay.clone() }
 
-    pub fn add_failed_relay(&mut self, relay: payjoin::Url) { self.failed_relays.push(relay); }
+    pub fn add_failed_relay(&mut self, relay: Url) { self.failed_relays.push(relay); }
 
-    pub fn get_failed_relays(&self) -> Vec<payjoin::Url> { self.failed_relays.clone() }
+    pub fn get_failed_relays(&self) -> Vec<Url> { self.failed_relays.clone() }
 }
 
 pub(crate) struct ValidatedOhttpKeys {
     pub(crate) ohttp_keys: payjoin::OhttpKeys,
-    pub(crate) relay_url: payjoin::Url,
+    pub(crate) relay_url: Url,
 }
 
 pub(crate) async fn unwrap_ohttp_keys_or_else_fetch(
     config: &Config,
-    directory: Option<payjoin::Url>,
+    directory: Option<Url>,
     relay_manager: Arc<Mutex<RelayManager>>,
 ) -> Result<ValidatedOhttpKeys> {
     if let Some(ohttp_keys) = config.v2()?.ohttp_keys.clone() {
         println!("Using OHTTP Keys from config");
-        return Ok(ValidatedOhttpKeys {
-            ohttp_keys,
-            relay_url: config.v2()?.ohttp_relays[0].clone(),
-        });
+        let validated = fetch_ohttp_keys(config, directory, relay_manager).await?;
+        Ok(ValidatedOhttpKeys { ohttp_keys, relay_url: validated.relay_url })
     } else {
         println!("Bootstrapping private network transport over Oblivious HTTP");
         let fetched_keys = fetch_ohttp_keys(config, directory, relay_manager).await?;
@@ -48,7 +56,7 @@ pub(crate) async fn unwrap_ohttp_keys_or_else_fetch(
 
 async fn fetch_ohttp_keys(
     config: &Config,
-    directory: Option<payjoin::Url>,
+    directory: Option<Url>,
     relay_manager: Arc<Mutex<RelayManager>>,
 ) -> Result<ValidatedOhttpKeys> {
     use payjoin::bitcoin::secp256k1::rand::prelude::SliceRandom;
@@ -78,20 +86,26 @@ async fn fetch_ohttp_keys(
             .set_selected_relay(selected_relay.clone());
 
         let ohttp_keys = {
-            #[cfg(feature = "_danger-local-https")]
+            #[cfg(feature = "_manual-tls")]
             {
-                let cert_der = crate::app::read_local_cert()?;
-                payjoin::io::fetch_ohttp_keys_with_cert(
-                    &selected_relay,
-                    &payjoin_directory,
-                    cert_der,
-                )
-                .await
+                if let Some(cert_path) = config.root_certificate.as_ref() {
+                    let cert_der = std::fs::read(cert_path)?;
+                    payjoin::io::fetch_ohttp_keys_with_cert(
+                        selected_relay.as_str(),
+                        payjoin_directory.as_str(),
+                        &cert_der,
+                    )
+                    .await
+                } else {
+                    payjoin::io::fetch_ohttp_keys(
+                        selected_relay.as_str(),
+                        payjoin_directory.as_str(),
+                    )
+                    .await
+                }
             }
-            #[cfg(not(feature = "_danger-local-https"))]
-            {
-                payjoin::io::fetch_ohttp_keys(&selected_relay, &payjoin_directory).await
-            }
+            #[cfg(not(feature = "_manual-tls"))]
+            payjoin::io::fetch_ohttp_keys(selected_relay.as_str(), payjoin_directory.as_str()).await
         };
 
         match ohttp_keys {
@@ -101,7 +115,7 @@ async fn fetch_ohttp_keys(
                 return Err(payjoin::io::Error::UnexpectedStatusCode(e).into());
             }
             Err(e) => {
-                log::debug!("Failed to connect to relay: {selected_relay}, {e:?}");
+                tracing::debug!("Failed to connect to relay: {selected_relay}, {e:?}");
                 relay_manager
                     .lock()
                     .expect("Lock should not be poisoned")

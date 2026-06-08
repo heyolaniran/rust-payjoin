@@ -1,9 +1,23 @@
 [workspace]
-members = ["payjoin", "payjoin-cli", "payjoin-directory", "payjoin-test-utils"]
+members = [
+  "fuzz",
+  "payjoin",
+  "payjoin-cli",
+  "payjoin-test-utils",
+  "payjoin-ffi",
+  "payjoin-mailroom",
+]
 resolver = "2"
-exclude = ["payjoin-ffi"]
 
 [patch.crates-io]
+payjoin-fuzz = { path = "fuzz" }
 payjoin = { path = "payjoin" }
-payjoin-directory = { path = "payjoin-directory" }
+payjoin-mailroom = { path = "payjoin-mailroom" }
 payjoin-test-utils = { path = "payjoin-test-utils" }
+
+[patch."https://github.com/payjoin/rust-payjoin.git"]
+payjoin = { path = "payjoin" }
+
+[profile.nix-ci]
+inherits = "test"
+debug = false

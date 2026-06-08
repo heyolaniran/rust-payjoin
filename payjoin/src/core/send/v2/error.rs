@@ -1,7 +1,7 @@
 use core::fmt;
 
 use crate::ohttp::DirectoryResponseError;
-use crate::uri::url_ext::ParseReceiverPubkeyParamError;
+use crate::time::Time;
 
 /// Error returned when request could not be created.
 ///
@@ -16,9 +16,7 @@ pub(crate) enum InternalCreateRequestError {
     Url(crate::into_url::Error),
     Hpke(crate::hpke::HpkeError),
     OhttpEncapsulation(crate::ohttp::OhttpEncapsulationError),
-    ParseReceiverPubkey(ParseReceiverPubkeyParamError),
-    MissingOhttpConfig,
-    Expired(std::time::SystemTime),
+    Expired(Time),
 }
 
 impl fmt::Display for CreateRequestError {
@@ -29,10 +27,7 @@ impl fmt::Display for CreateRequestError {
             Url(e) => write!(f, "cannot parse url: {e:#?}"),
             Hpke(e) => write!(f, "v2 error: {e}"),
             OhttpEncapsulation(e) => write!(f, "v2 error: {e}"),
-            ParseReceiverPubkey(e) => write!(f, "cannot parse receiver public key: {e}"),
-            MissingOhttpConfig =>
-                write!(f, "no ohttp configuration with which to make a v2 request available"),
-            Expired(expiry) => write!(f, "session expired at {expiry:?}"),
+            Expired(_expiration) => write!(f, "session expired"),
         }
     }
 }
@@ -45,8 +40,6 @@ impl std::error::Error for CreateRequestError {
             Url(error) => Some(error),
             Hpke(error) => Some(error),
             OhttpEncapsulation(error) => Some(error),
-            ParseReceiverPubkey(error) => Some(error),
-            MissingOhttpConfig => None,
             Expired(_) => None,
         }
     }
@@ -56,33 +49,33 @@ impl From<InternalCreateRequestError> for CreateRequestError {
     fn from(value: InternalCreateRequestError) -> Self { CreateRequestError(value) }
 }
 
+impl CreateRequestError {
+    /// Returns `true` if the request could not be created because the session
+    /// has expired.
+    pub fn is_expired(&self) -> bool { matches!(self.0, InternalCreateRequestError::Expired(_)) }
+}
+
 impl From<crate::into_url::Error> for CreateRequestError {
     fn from(value: crate::into_url::Error) -> Self {
         CreateRequestError(InternalCreateRequestError::Url(value))
     }
 }
 
-impl From<ParseReceiverPubkeyParamError> for CreateRequestError {
-    fn from(value: ParseReceiverPubkeyParamError) -> Self {
-        CreateRequestError(InternalCreateRequestError::ParseReceiverPubkey(value))
-    }
-}
-
-/// Error returned for v2-specific payload encapsulation errors.
+/// Error returned for v2-specific payload decapsulation errors.
 #[derive(Debug)]
-pub struct EncapsulationError(InternalEncapsulationError);
+pub struct DecapsulationError(InternalDecapsulationError);
 
 #[derive(Debug)]
-pub(crate) enum InternalEncapsulationError {
+pub(crate) enum InternalDecapsulationError {
     /// The HPKE failed.
     Hpke(crate::hpke::HpkeError),
     /// The directory returned a bad response
     DirectoryResponse(DirectoryResponseError),
 }
 
-impl fmt::Display for EncapsulationError {
+impl fmt::Display for DecapsulationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use InternalEncapsulationError::*;
+        use InternalDecapsulationError::*;
 
         match &self.0 {
             Hpke(error) => write!(f, "HPKE error: {error}"),
@@ -91,9 +84,9 @@ impl fmt::Display for EncapsulationError {
     }
 }
 
-impl std::error::Error for EncapsulationError {
+impl std::error::Error for DecapsulationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use InternalEncapsulationError::*;
+        use InternalDecapsulationError::*;
 
         match &self.0 {
             Hpke(error) => Some(error),
@@ -102,12 +95,27 @@ impl std::error::Error for EncapsulationError {
     }
 }
 
-impl From<InternalEncapsulationError> for EncapsulationError {
-    fn from(value: InternalEncapsulationError) -> Self { EncapsulationError(value) }
+impl From<InternalDecapsulationError> for DecapsulationError {
+    fn from(value: InternalDecapsulationError) -> Self { DecapsulationError(value) }
 }
 
-impl From<InternalEncapsulationError> for super::ResponseError {
-    fn from(value: InternalEncapsulationError) -> Self {
-        super::InternalValidationError::V2Encapsulation(value.into()).into()
+impl From<InternalDecapsulationError> for super::ResponseError {
+    fn from(value: InternalDecapsulationError) -> Self {
+        super::InternalValidationError::V2Decapsulation(value.into()).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_request_error_is_expired() {
+        let expired = CreateRequestError(InternalCreateRequestError::Expired(Time::now()));
+        assert!(expired.is_expired());
+
+        let other =
+            CreateRequestError(InternalCreateRequestError::Url(crate::into_url::Error::BadScheme));
+        assert!(!other.is_expired());
     }
 }

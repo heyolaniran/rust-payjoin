@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
 set -e
-
-RUST_VERSION=$(rustc --version | awk '{print $2}')
-
-if [[ ! "$RUST_VERSION" =~ ^1\.63\. ]]; then
-  cargo test --package payjoin-ffi --verbose --features=_danger-local-https,_test-utils
-else
-  echo "Skipping payjoin-ffi tests for Rust version $RUST_VERSION (MSRV)"
-fi
+cd "$(dirname "$0")/.."
+cargo test --package payjoin-ffi --verbose --features=_manual-tls,_test-utils
+BINDINGS="dart javascript python csharp"
+pids=()
+tmpfiles=()
+for binding in $BINDINGS; do
+    tmpfile=$(mktemp)
+    tmpfiles+=("$tmpfile")
+    (cd "$binding" && ./contrib/test.sh) >"$tmpfile" 2>&1 &
+    pids+=($!)
+done
+failed=0
+set +e
+i=0
+for pid in "${pids[@]}"; do
+    binding=$(echo "$BINDINGS" | tr ' ' '\n' | sed -n "$((i + 1))p")
+    if ! wait "$pid"; then
+        failed=1
+        echo ""
+        echo "==> FAILED: $binding"
+        echo "--- output ---"
+        cat "${tmpfiles[$i]}"
+        echo "--------------"
+    fi
+    rm -f "${tmpfiles[$i]}"
+    i=$((i + 1))
+done
+set -e
+exit $failed

@@ -1,19 +1,23 @@
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use payjoin::bitcoin::consensus::encode::serialize_hex;
 use payjoin::bitcoin::{Amount, FeeRate};
-use payjoin::persist::OptionalTransitionOutcome;
+use payjoin::persist::{OptionalTransitionOutcome, SessionPersister};
 use payjoin::receive::v2::{
-    process_err_res, replay_event_log as replay_receiver_event_log, Initialized, MaybeInputsOwned,
-    MaybeInputsSeen, OutputsUnknown, PayjoinProposal, ProvisionalProposal, ReceiveSession,
-    Receiver, SessionHistory, UncheckedProposal, WantsInputs, WantsOutputs,
+    replay_event_log as replay_receiver_event_log, HasReplyableError, Initialized,
+    MaybeInputsOwned, MaybeInputsSeen, Monitor, OutputsUnknown, PayjoinProposal,
+    PendingFallback as ReceiverPendingFallback, ProvisionalProposal, ReceiveSession, Receiver,
+    ReceiverBuilder, SessionOutcome as ReceiverSessionOutcome, UncheckedOriginalPayload,
+    WantsFeeRange, WantsInputs, WantsOutputs,
 };
 use payjoin::send::v2::{
-    replay_event_log as replay_sender_event_log, SendSession, Sender, SenderBuilder, V2GetContext,
+    replay_event_log as replay_sender_event_log, PendingFallback as SenderPendingFallback,
+    PollingForProposal, SendSession, Sender, SenderBuilder, SessionOutcome as SenderSessionOutcome,
     WithReplyKey,
 };
-use payjoin::Uri;
+use payjoin::{ImplementationError, PjParam, Uri};
 use tokio::sync::watch;
 
 use super::config::Config;
@@ -21,10 +25,16 @@ use super::wallet::BitcoindWallet;
 use super::App as AppTrait;
 use crate::app::v2::ohttp::{unwrap_ohttp_keys_or_else_fetch, RelayManager};
 use crate::app::{handle_interrupt, http_agent};
-use crate::db::v2::{ReceiverPersister, SenderPersister};
+use crate::cli::Role as CliRole;
+use crate::db::v2::{ReceiverPersister, SenderPersister, SessionId};
 use crate::db::Database;
 
 mod ohttp;
+
+const W_ID: usize = 12;
+const W_ROLE: usize = 25;
+const W_DONE: usize = 15;
+const W_STATUS: usize = 15;
 
 #[derive(Clone)]
 pub(crate) struct App {
@@ -35,14 +45,107 @@ pub(crate) struct App {
     relay_manager: Arc<Mutex<RelayManager>>,
 }
 
+trait StatusText {
+    fn status_text(&self) -> &'static str;
+}
+
+impl StatusText for SendSession {
+    fn status_text(&self) -> &'static str {
+        match self {
+            SendSession::WithReplyKey(_) | SendSession::PollingForProposal(_) =>
+                "Waiting for proposal",
+            SendSession::Closed(session_outcome) => match session_outcome {
+                SenderSessionOutcome::Aborted => "Session aborted",
+                SenderSessionOutcome::Success(_) => "Session success",
+            },
+            SendSession::PendingFallback(_) => "Session awaiting fallback",
+        }
+    }
+}
+
+impl StatusText for ReceiveSession {
+    fn status_text(&self) -> &'static str {
+        match self {
+            ReceiveSession::Initialized(_) => "Waiting for original proposal",
+            ReceiveSession::UncheckedOriginalPayload(_)
+            | ReceiveSession::MaybeInputsOwned(_)
+            | ReceiveSession::MaybeInputsSeen(_)
+            | ReceiveSession::OutputsUnknown(_)
+            | ReceiveSession::WantsOutputs(_)
+            | ReceiveSession::WantsInputs(_)
+            | ReceiveSession::WantsFeeRange(_)
+            | ReceiveSession::ProvisionalProposal(_) => "Processing original proposal",
+            ReceiveSession::PayjoinProposal(_) => "Payjoin proposal sent",
+            ReceiveSession::HasReplyableError(_) =>
+                "Session failure, waiting to post error response",
+            ReceiveSession::Monitor(_) => "Monitoring payjoin proposal",
+            ReceiveSession::PendingFallback(_) => "Pending fallback handling",
+            ReceiveSession::Closed(session_outcome) => match session_outcome {
+                ReceiverSessionOutcome::Aborted => "Session aborted",
+                ReceiverSessionOutcome::Success(_) => "Session success, Payjoin proposal was broadcasted",
+                ReceiverSessionOutcome::FallbackBroadcasted => "Fallback broadcasted",
+                ReceiverSessionOutcome::PayjoinProposalSent =>
+                    "Payjoin proposal sent, skipping monitoring as the sender is spending non-SegWit inputs",
+            },
+        }
+    }
+}
+
+fn print_header() {
+    println!(
+        "{:<W_ID$} {:<W_ROLE$} {:<W_DONE$} {:<W_STATUS$}",
+        "Session ID", "Sender/Receiver", "Completed At", "Status"
+    );
+}
+
+enum Role {
+    Sender,
+    Receiver,
+}
+impl Role {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Role::Sender => "Sender",
+            Role::Receiver => "Receiver",
+        }
+    }
+}
+
+struct SessionHistoryRow<Status> {
+    session_id: SessionId,
+    role: Role,
+    status: Status,
+    completed_at: Option<u64>,
+    error_message: Option<String>,
+}
+
+impl<Status: StatusText> fmt::Display for SessionHistoryRow<Status> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:<W_ID$} {:<W_ROLE$} {:<W_DONE$} {:<W_STATUS$}",
+            self.session_id.to_string(),
+            self.role.as_str(),
+            match self.completed_at {
+                None => "Not Completed".to_string(),
+                Some(secs) => {
+                    // TODO: human readable time
+                    secs.to_string()
+                }
+            },
+            self.error_message.as_deref().unwrap_or(self.status.status_text())
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl AppTrait for App {
-    fn new(config: Config) -> Result<Self> {
+    async fn new(config: Config) -> Result<Self> {
         let db = Arc::new(Database::create(&config.db_path)?);
         let relay_manager = Arc::new(Mutex::new(RelayManager::new()));
         let (interrupt_tx, interrupt_rx) = watch::channel(());
         tokio::spawn(handle_interrupt(interrupt_tx));
-        let wallet = BitcoindWallet::new(&config.bitcoind)?;
+        let wallet = BitcoindWallet::new(&config.bitcoind).await?;
         let app = Self { config, db, wallet, interrupt: interrupt_rx, relay_manager };
         app.wallet()
             .network()
@@ -55,42 +158,121 @@ impl AppTrait for App {
     #[allow(clippy::incompatible_msrv)]
     async fn send_payjoin(&self, bip21: &str, fee_rate: FeeRate) -> Result<()> {
         use payjoin::UriExt;
-        let uri =
-            Uri::try_from(bip21).map_err(|e| anyhow!("Failed to create URI from BIP21: {}", e))?;
-        let uri = uri.assume_checked();
-        let uri = uri.check_pj_supported().map_err(|_| anyhow!("URI does not support Payjoin"))?;
-        let url = uri.extras.endpoint();
-        // TODO: perhaps we should store pj uri in the session wrapper as to not replay the event log for each session
-        let sender_state = self.db.get_send_session_ids()?.into_iter().find_map(|session_id| {
-            let sender_persister = SenderPersister::from_id(self.db.clone(), session_id).ok()?;
-            let replay_results = replay_sender_event_log(&sender_persister)
-                .map_err(|e| anyhow!("Failed to replay sender event log: {:?}", e))
-                .ok()?;
+        let uri = Uri::try_from(bip21)
+            .map_err(|e| anyhow!("Failed to create URI from BIP21: {}", e))?
+            .assume_checked()
+            .check_pj_supported()
+            .map_err(|_| anyhow!("URI does not support Payjoin"))?;
+        let address = uri.address;
+        let amount = uri.amount.ok_or_else(|| anyhow!("please specify the amount in the Uri"))?;
+        match uri.extras.pj_param() {
+            #[cfg(feature = "v1")]
+            PjParam::V1(pj_param) => {
+                let psbt = self.create_original_psbt(&address, amount, fee_rate)?;
+                let fallback_tx = psbt.clone().extract_tx()?;
+                let (req, ctx) = payjoin::send::v1::SenderBuilder::from_parts(
+                    psbt,
+                    pj_param,
+                    &address,
+                    Some(amount),
+                )
+                .build_recommended(fee_rate)
+                .with_context(|| "Failed to build payjoin request")?
+                .create_v1_post_request();
+                let http = http_agent(&self.config)?;
+                let body = String::from_utf8(req.body.clone()).unwrap();
+                println!("Sending Original PSBT to {}", req.url);
+                let response = match http
+                    .post(req.url)
+                    .header("Content-Type", req.content_type)
+                    .body(body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(e) => {
+                        tracing::error!("HTTP request failed: {e}");
+                        println!("Payjoin failed. To broadcast the fallback transaction, run:");
+                        println!(
+                            "  bitcoin-cli -rpcwallet=<wallet> sendrawtransaction {:#}",
+                            payjoin::bitcoin::consensus::encode::serialize_hex(&fallback_tx)
+                        );
+                        return Err(anyhow!("HTTP request failed: {e}"));
+                    }
+                };
+                let psbt = match ctx.process_response(&response.bytes().await?) {
+                    Ok(psbt) => psbt,
+                    Err(e) => {
+                        tracing::error!("Error processing response: {e:?}");
+                        println!("Payjoin failed. To broadcast the fallback transaction, run:");
+                        println!(
+                            "  bitcoin-cli -rpcwallet=<wallet> sendrawtransaction {:#}",
+                            payjoin::bitcoin::consensus::encode::serialize_hex(&fallback_tx)
+                        );
+                        return Err(anyhow!("Failed to process response {e}"));
+                    }
+                };
 
-            let pj_uri = replay_results.1.endpoint();
-            let sender_state = pj_uri.filter(|uri| uri == &url).map(|_| replay_results.0);
-            sender_state.map(|sender_state| (sender_state, sender_persister))
-        });
-
-        let (sender_state, persister) = match sender_state {
-            Some((sender_state, persister)) => (sender_state, persister),
-            None => {
-                let persister = SenderPersister::new(self.db.clone())?;
-                let psbt = self.create_original_psbt(&uri, fee_rate)?;
-                let sender = SenderBuilder::new(psbt, uri.clone())
-                    .build_recommended(fee_rate)
-                    .save(&persister)?;
-
-                (SendSession::WithReplyKey(sender), persister)
+                self.process_pj_response(psbt)?;
+                Ok(())
             }
-        };
-        let mut interrupt = self.interrupt.clone();
-        tokio::select! {
-            _ = self.process_sender_session(sender_state, &persister) => return Ok(()),
-            _ = interrupt.changed() => {
-                println!("Interrupted. Call `send` with the same arguments to resume this session or `resume` to resume all sessions.");
-                return Err(anyhow!("Interrupted"))
+            PjParam::V2(pj_param) => {
+                let receiver_pubkey = pj_param.receiver_pubkey();
+                let sender_state =
+                    self.db.get_send_session_ids()?.into_iter().find_map(|session_id| {
+                        let session_receiver_pubkey = self
+                            .db
+                            .get_send_session_receiver_pk(&session_id)
+                            .expect("Receiver pubkey should exist if session id exists");
+                        if session_receiver_pubkey == *receiver_pubkey {
+                            let sender_persister =
+                                SenderPersister::from_id(self.db.clone(), session_id);
+                            let (send_session, _) = replay_sender_event_log(&sender_persister)
+                                .map_err(|e| anyhow!("Failed to replay sender event log: {:?}", e))
+                                .ok()?;
+
+                            Some((send_session, sender_persister))
+                        } else {
+                            None
+                        }
+                    });
+
+                let (sender_state, persister) = match sender_state {
+                    Some((sender_state, persister)) => (sender_state, persister),
+                    None => {
+                        let persister =
+                            SenderPersister::new(self.db.clone(), bip21, receiver_pubkey)?;
+                        let psbt = self.create_original_psbt(&address, amount, fee_rate)?;
+                        let sender =
+                            SenderBuilder::from_parts(psbt, pj_param, &address, Some(amount))
+                                .build_recommended(fee_rate)?
+                                .save(&persister)?;
+
+                        (SendSession::WithReplyKey(sender), persister)
+                    }
+                };
+                let mut interrupt = self.interrupt.clone();
+                tokio::select! {
+                    res = self.process_sender_session(sender_state, &persister) => {
+                        match res {
+                            Ok(()) => return Ok(()),
+                            Err(err) => {
+                                let id = persister.session_id();
+                                println!("Session {id} failed. Run `payjoin-cli cancel {id}` to cancel and broadcast the original transaction.");
+                                return Err(err);
+                            }
+                        }
+                    },
+                    _ = interrupt.changed() => {
+                        let id = persister.session_id();
+                        println!(
+                            "Session {id} interrupted. Call `send` again to resume, `resume` to resume all sessions, or `payjoin-cli cancel {id}` to cancel and broadcast the original transaction."
+                        );
+                        return Err(anyhow!("Interrupted"))
+                    }
+                }
             }
+            _ => unimplemented!("Unrecognized payjoin version"),
         }
     }
 
@@ -101,25 +283,24 @@ impl AppTrait for App {
                 .await?
                 .ohttp_keys;
         let persister = ReceiverPersister::new(self.db.clone())?;
-        let session = Receiver::create_session(
-            address,
-            self.config.v2()?.pj_directory.clone(),
-            ohttp_keys,
-            None,
-        )
-        .save(&persister)?;
+        let mut receiver_builder =
+            ReceiverBuilder::new(address, self.config.v2()?.pj_directory.as_str(), ohttp_keys)?
+                .with_amount(amount);
+        if let Some(max_fee_rate) = self.config.max_fee_rate {
+            receiver_builder = receiver_builder.with_max_fee_rate(max_fee_rate);
+        }
+        let session = receiver_builder.build().save(&persister)?;
+
         println!("Receive session established");
-        let mut pj_uri = session.pj_uri();
-        pj_uri.amount = Some(amount);
+        let pj_uri = session.pj_uri();
         println!("Request Payjoin by sharing this Payjoin Uri:");
-        println!("{}", pj_uri);
+        println!("{pj_uri}");
 
         self.process_receiver_session(ReceiveSession::Initialized(session.clone()), &persister)
             .await?;
         Ok(())
     }
 
-    #[allow(clippy::incompatible_msrv)]
     async fn resume_payjoins(&self) -> Result<()> {
         let recv_session_ids = self.db.get_recv_session_ids()?;
         let send_session_ids = self.db.get_send_session_ids()?;
@@ -129,76 +310,382 @@ impl AppTrait for App {
             return Ok(());
         }
 
-        let mut tasks = Vec::new();
+        let mut tasks: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
 
+        // Process receiver sessions
         for session_id in recv_session_ids {
             let self_clone = self.clone();
-            let recv_persister = ReceiverPersister::from_id(self.db.clone(), session_id)?;
-            let receiver_state = replay_receiver_event_log(&recv_persister)
-                .map_err(|e| anyhow!("Failed to replay receiver event log: {:?}", e))?
-                .0;
-            tasks.push(tokio::spawn(async move {
-                self_clone.process_receiver_session(receiver_state, &recv_persister).await
-            }));
+            let recv_persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
+            match replay_receiver_event_log(&recv_persister) {
+                Ok((receiver_state, _)) => {
+                    tasks.push((
+                        session_id.to_string(),
+                        tokio::spawn(async move {
+                            self_clone
+                                .process_receiver_session(receiver_state, &recv_persister)
+                                .await
+                        }),
+                    ));
+                }
+                Err(e) => {
+                    if e.is_expired() {
+                        println!("Session {session_id} receiver expired.");
+                    } else {
+                        tracing::error!(
+                            "An error {:?} occurred while replaying receiver session",
+                            e
+                        );
+                        println!("Session {session_id} receiver failed to replay -  {e}");
+                    }
+                    Self::close_failed_session(&recv_persister, &session_id, "receiver");
+                }
+            }
         }
 
+        // Process sender sessions
         for session_id in send_session_ids {
-            let sender_persiter = SenderPersister::from_id(self.db.clone(), session_id)?;
-            let sender_state = replay_sender_event_log(&sender_persiter)
-                .map_err(|e| anyhow!("Failed to replay sender event log: {:?}", e))?
-                .0;
-            let self_clone = self.clone();
-            tasks.push(tokio::spawn(async move {
-                self_clone.process_sender_session(sender_state, &sender_persiter).await
-            }));
+            let sender_persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
+            match replay_sender_event_log(&sender_persister) {
+                Ok((sender_state, _)) => {
+                    let self_clone = self.clone();
+                    tasks.push((
+                        session_id.clone().to_string(),
+                        tokio::spawn(async move {
+                            self_clone.process_sender_session(sender_state, &sender_persister).await
+                        }),
+                    ));
+                }
+                Err(e) => {
+                    if e.is_expired() {
+                        println!("Session {session_id} sender expired.");
+                    } else {
+                        tracing::error!("An error {:?} occurred while replaying Sender session", e);
+                        println!("Session {session_id} sender failed to replay -  {e}");
+                    }
+                    Self::close_failed_session(&sender_persister, &session_id, "sender");
+                }
+            }
         }
 
         let mut interrupt = self.interrupt.clone();
         tokio::select! {
             _ = async {
-                for task in tasks {
-                    let _ = task.await;
+
+                for (session_id, task) in tasks {
+                    match task.await {
+                        Ok(Ok(())) => {
+                            println!("Session {session_id} completed.");
+                        }
+                        Ok(Err(e)) => {
+                            println!("Session {session_id} error: {e:#}");
+                        }
+                        Err(e) => {
+                            println!("Session {session_id} panicked or was cancelled: {e:?}");
+                        }
+                    }
                 }
-            } => {
-                println!("All resumed sessions completed.");
-            }
+        } => {}
             _ = interrupt.changed() => {
                 println!("Resumed sessions were interrupted.");
             }
         }
         Ok(())
     }
+
+    #[cfg(feature = "v2")]
+    async fn history(&self) -> Result<()> {
+        print_header();
+        let mut send_rows = vec![];
+        let mut recv_rows = vec![];
+        self.db.get_send_session_ids()?.into_iter().for_each(|session_id| {
+            let persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
+            match replay_sender_event_log(&persister) {
+                Ok((sender_state, _)) => {
+                    let row = SessionHistoryRow {
+                        session_id,
+                        role: Role::Sender,
+                        status: sender_state.clone(),
+                        completed_at: None,
+                        error_message: None,
+                    };
+                    send_rows.push(row);
+                }
+                Err(e) => {
+                    let row = SessionHistoryRow {
+                        session_id,
+                        role: Role::Sender,
+                        status: SendSession::Closed(SenderSessionOutcome::Aborted),
+                        completed_at: None,
+                        error_message: Some(e.to_string()),
+                    };
+                    send_rows.push(row);
+                }
+            }
+        });
+
+        self.db.get_recv_session_ids()?.into_iter().for_each(|session_id| {
+            let persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
+            match replay_receiver_event_log(&persister) {
+                Ok((receiver_state, _)) => {
+                    let row = SessionHistoryRow {
+                        session_id,
+                        role: Role::Receiver,
+                        status: receiver_state.clone(),
+                        completed_at: None,
+                        error_message: None,
+                    };
+                    recv_rows.push(row);
+                }
+                Err(e) => {
+                    let row = SessionHistoryRow {
+                        session_id,
+                        role: Role::Receiver,
+                        status: ReceiveSession::Closed(ReceiverSessionOutcome::Aborted),
+                        completed_at: None,
+                        error_message: Some(e.to_string()),
+                    };
+                    recv_rows.push(row);
+                }
+            }
+        });
+
+        self.db.get_inactive_send_session_ids()?.into_iter().for_each(
+            |(session_id, completed_at)| {
+                let persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
+                match replay_sender_event_log(&persister) {
+                    Ok((sender_state, _)) => {
+                        let row = SessionHistoryRow {
+                            session_id,
+                            role: Role::Sender,
+                            status: sender_state.clone(),
+                            completed_at: Some(completed_at),
+                            error_message: None,
+                        };
+                        send_rows.push(row);
+                    }
+                    Err(e) => {
+                        let row = SessionHistoryRow {
+                            session_id,
+                            role: Role::Sender,
+                            status: SendSession::Closed(SenderSessionOutcome::Aborted),
+                            completed_at: Some(completed_at),
+                            error_message: Some(e.to_string()),
+                        };
+                        send_rows.push(row);
+                    }
+                }
+            },
+        );
+
+        self.db.get_inactive_recv_session_ids()?.into_iter().for_each(
+            |(session_id, completed_at)| {
+                let persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
+                match replay_receiver_event_log(&persister) {
+                    Ok((receiver_state, _)) => {
+                        let row = SessionHistoryRow {
+                            session_id,
+                            role: Role::Receiver,
+                            status: receiver_state.clone(),
+                            completed_at: Some(completed_at),
+                            error_message: None,
+                        };
+                        recv_rows.push(row);
+                    }
+                    Err(e) => {
+                        let row = SessionHistoryRow {
+                            session_id,
+                            role: Role::Receiver,
+                            status: ReceiveSession::Closed(ReceiverSessionOutcome::Aborted),
+                            completed_at: Some(completed_at),
+                            error_message: Some(e.to_string()),
+                        };
+                        recv_rows.push(row);
+                    }
+                }
+            },
+        );
+
+        // Print receiver and sender rows separately
+        for row in send_rows {
+            println!("{row}");
+        }
+        for row in recv_rows {
+            println!("{row}");
+        }
+
+        Ok(())
+    }
+
+    async fn cancel(
+        &self,
+        session_id: SessionId,
+        no_broadcast: bool,
+        role: Option<CliRole>,
+    ) -> Result<()> {
+        if let Some(role) = role {
+            return match role {
+                CliRole::Sender => self.cancel_sender_session(session_id, no_broadcast),
+                CliRole::Receiver => self.cancel_receiver_session(session_id, no_broadcast),
+            };
+        }
+
+        let send_ids = self.db.get_send_session_ids()?;
+        let recv_ids = self.db.get_recv_session_ids()?;
+        let is_sender = send_ids.iter().any(|id| id.0 == session_id.0);
+        let is_receiver = recv_ids.iter().any(|id| id.0 == session_id.0);
+
+        match (is_sender, is_receiver) {
+            (true, false) => self.cancel_sender_session(session_id, no_broadcast),
+            (false, true) => self.cancel_receiver_session(session_id, no_broadcast),
+            (true, true) => anyhow::bail!(
+                "Session {session_id} exists as both a sender and receiver session. \
+                 Pass `--role sender` or `--role receiver`."
+            ),
+            (false, false) => anyhow::bail!("Session {session_id} not found"),
+        }
+    }
 }
 
 impl App {
+    fn cancel_sender_session(&self, session_id: SessionId, no_broadcast: bool) -> Result<()> {
+        let persister = SenderPersister::from_id(self.db.clone(), session_id.clone());
+        let (session, _history) = replay_sender_event_log(&persister)?;
+
+        let pending: Sender<SenderPendingFallback> = match session {
+            SendSession::WithReplyKey(sender) => sender.cancel().save(&persister)?,
+            SendSession::PollingForProposal(sender) => sender.cancel().save(&persister)?,
+            SendSession::PendingFallback(sender) => sender,
+            SendSession::Closed(SenderSessionOutcome::Success(proposal)) => {
+                let txid = proposal.extract_tx_unchecked_fee_rate().compute_txid();
+                println!(
+                    "Session {session_id} already produced payjoin transaction {txid}. \
+                     Cannot cancel a completed session."
+                );
+                return Ok(());
+            }
+            SendSession::Closed(_) => {
+                println!("Session {session_id} is already closed. Nothing left to do.");
+                return Ok(());
+            }
+        };
+
+        if no_broadcast {
+            println!(
+                "Session {session_id} cancelled. Broadcast the original transaction manually:\n{}",
+                serialize_hex(pending.fallback_tx())
+            );
+        } else {
+            self.wallet().broadcast_tx(pending.fallback_tx())?;
+            println!(
+                "Broadcasted fallback transaction txid: {}",
+                pending.fallback_tx().compute_txid()
+            );
+        }
+        pending.close().save(&persister)?;
+        Ok(())
+    }
+
+    fn cancel_receiver_session(&self, session_id: SessionId, no_broadcast: bool) -> Result<()> {
+        let persister = ReceiverPersister::from_id(self.db.clone(), session_id.clone());
+        let (session, _history) = replay_receiver_event_log(&persister)?;
+
+        let pending: Receiver<ReceiverPendingFallback> = match session {
+            ReceiveSession::Initialized(receiver) => {
+                receiver.cancel().save(&persister)?;
+                println!("Session {session_id} cancelled. No fallback transaction to broadcast.");
+                return Ok(());
+            }
+            ReceiveSession::UncheckedOriginalPayload(receiver) => {
+                receiver.cancel().save(&persister)?;
+                println!("Session {session_id} cancelled. No fallback transaction to broadcast.");
+                return Ok(());
+            }
+            ReceiveSession::MaybeInputsOwned(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::MaybeInputsSeen(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::OutputsUnknown(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::WantsOutputs(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::WantsInputs(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::WantsFeeRange(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::ProvisionalProposal(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::PayjoinProposal(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::Monitor(receiver) => receiver.cancel().save(&persister)?,
+            ReceiveSession::HasReplyableError(receiver) => match receiver
+                .cancel()
+                .save(&persister)?
+            {
+                Some(pending) => pending,
+                None => {
+                    println!("Session {session_id} cancelled. No fallback transaction available.");
+                    return Ok(());
+                }
+            },
+            ReceiveSession::PendingFallback(receiver) => receiver,
+            ReceiveSession::Closed(
+                ReceiverSessionOutcome::Success(_)
+                | ReceiverSessionOutcome::FallbackBroadcasted
+                | ReceiverSessionOutcome::PayjoinProposalSent,
+            ) => {
+                println!("Session {session_id} already completed successfully. Cannot cancel.");
+                return Ok(());
+            }
+            ReceiveSession::Closed(_) => {
+                println!("Session {session_id} is already closed. Nothing left to do.");
+                return Ok(());
+            }
+        };
+
+        if no_broadcast {
+            println!(
+                "Session {session_id} cancelled. Broadcast the fallback transaction manually:\n{}",
+                serialize_hex(pending.fallback_tx())
+            );
+        } else {
+            self.wallet().broadcast_tx(pending.fallback_tx())?;
+            println!(
+                "Broadcasted fallback transaction txid: {}",
+                pending.fallback_tx().compute_txid()
+            );
+        }
+        pending.close().save(&persister)?;
+        Ok(())
+    }
+
+    fn close_failed_session<P>(persister: &P, session_id: &SessionId, role: &str)
+    where
+        P: SessionPersister,
+    {
+        if let Err(close_err) = SessionPersister::close(persister) {
+            tracing::error!("Failed to close {} session {}: {:?}", role, session_id, close_err);
+        } else {
+            tracing::error!("Closed failed {} session: {}", role, session_id);
+        }
+    }
+
     async fn process_sender_session(
         &self,
         session: SendSession,
         persister: &SenderPersister,
     ) -> Result<()> {
         match session {
-            SendSession::WithReplyKey(context) => {
-                // TODO: can we handle the fall back case in `post_original_proposal`. That way we don't have to clone here
-                match self.post_original_proposal(context.clone(), persister).await {
-                    Ok(()) => (),
-                    Err(_) => {
-                        let (req, v1_ctx) = context.create_v1_post_request();
-                        let response = post_request(req).await?;
-                        let psbt = Arc::new(
-                            v1_ctx.process_response(response.bytes().await?.to_vec().as_slice())?,
-                        );
-                        self.process_pj_response((*psbt).clone())?;
-                    }
-                }
-                return Ok(());
-            }
-            SendSession::V2GetContext(context) =>
+            SendSession::WithReplyKey(context) =>
+                self.post_original_proposal(context, persister).await?,
+            SendSession::PollingForProposal(context) =>
                 self.get_proposed_payjoin_psbt(context, persister).await?,
-            SendSession::ProposalReceived(proposal) => {
+            SendSession::Closed(SenderSessionOutcome::Success(proposal)) => {
                 self.process_pj_response(proposal)?;
                 return Ok(());
             }
-            _ => return Err(anyhow!("Unexpected sender state")),
+            SendSession::Closed(SenderSessionOutcome::Aborted) => {
+                println!("Session is closed. Nothing left to do");
+                return Ok(());
+            }
+            SendSession::PendingFallback(_) => {
+                let id = persister.session_id();
+                println!(
+                    "Session {id} was cancelled. Run `payjoin-cli cancel {id}` to cancel and broadcast the fallback transaction."
+                );
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -208,27 +695,25 @@ impl App {
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
     ) -> Result<()> {
-        let (req, ctx) = sender.create_v2_post_request(
-            self.unwrap_relay_or_else_fetch(Some(sender.endpoint().clone())).await?,
-        )?;
-        let response = post_request(req).await?;
-        println!("Posted original proposal...");
+        let relay = self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?;
+        let (req, ctx) = sender.create_v2_post_request(relay.as_str())?;
+        let response = self.post_request(req).await?;
         let sender = sender.process_response(&response.bytes().await?, ctx).save(persister)?;
+        println!("Posted Original PSBT...");
         self.get_proposed_payjoin_psbt(sender, persister).await
     }
 
     async fn get_proposed_payjoin_psbt(
         &self,
-        sender: Sender<V2GetContext>,
+        sender: Sender<PollingForProposal>,
         persister: &SenderPersister,
     ) -> Result<()> {
+        let ohttp_relay = self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?;
         let mut session = sender.clone();
         // Long poll until we get a response
         loop {
-            let (req, ctx) = session.create_poll_request(
-                self.unwrap_relay_or_else_fetch(Some(session.endpoint().clone())).await?,
-            )?;
-            let response = post_request(req).await?;
+            let (req, ctx) = session.create_poll_request(ohttp_relay.as_str())?;
+            let response = self.post_request(req).await?;
             let res = session.process_response(&response.bytes().await?, ctx).save(persister);
             match res {
                 Ok(OptionalTransitionOutcome::Progress(psbt)) => {
@@ -243,7 +728,7 @@ impl App {
                 }
                 Err(re) => {
                     println!("{re}");
-                    log::debug!("{re:?}");
+                    tracing::debug!("{re:?}");
                     return Err(anyhow!("Response error").context(re));
                 }
             }
@@ -254,16 +739,15 @@ impl App {
         &self,
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
-    ) -> Result<Receiver<UncheckedProposal>> {
-        let ohttp_relay = self
-            .unwrap_relay_or_else_fetch(Some(session.pj_uri().extras.endpoint().clone()))
-            .await?;
+    ) -> Result<Receiver<UncheckedOriginalPayload>> {
+        let ohttp_relay =
+            self.unwrap_relay_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
 
         let mut session = session;
         loop {
-            let (req, context) = session.create_poll_request(&ohttp_relay)?;
+            let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
             println!("Polling receive request...");
-            let ohttp_response = post_request(req).await?;
+            let ohttp_response = self.post_request(req).await?;
             let state_transition = session
                 .process_response(ohttp_response.bytes().await?.to_vec().as_slice(), context)
                 .save(persister);
@@ -290,7 +774,7 @@ impl App {
             match session {
                 ReceiveSession::Initialized(proposal) =>
                     self.read_from_directory(proposal, persister).await,
-                ReceiveSession::UncheckedProposal(proposal) =>
+                ReceiveSession::UncheckedOriginalPayload(proposal) =>
                     self.check_proposal(proposal, persister).await,
                 ReceiveSession::MaybeInputsOwned(proposal) =>
                     self.check_inputs_not_owned(proposal, persister).await,
@@ -302,31 +786,27 @@ impl App {
                     self.commit_outputs(proposal, persister).await,
                 ReceiveSession::WantsInputs(proposal) =>
                     self.contribute_inputs(proposal, persister).await,
+                ReceiveSession::WantsFeeRange(proposal) =>
+                    self.apply_fee_range(proposal, persister).await,
                 ReceiveSession::ProvisionalProposal(proposal) =>
                     self.finalize_proposal(proposal, persister).await,
                 ReceiveSession::PayjoinProposal(proposal) =>
                     self.send_payjoin_proposal(proposal, persister).await,
-                ReceiveSession::Uninitialized(_) =>
-                    return Err(anyhow!("Uninitialized receiver session")),
-                ReceiveSession::TerminalFailure =>
-                    return Err(anyhow!("Terminal receiver session")),
+                ReceiveSession::HasReplyableError(error) =>
+                    self.handle_error(error, persister).await,
+                ReceiveSession::Monitor(proposal) =>
+                    self.monitor_payjoin_proposal(proposal, persister).await,
+                ReceiveSession::PendingFallback(_) => {
+                    let id = persister.session_id();
+                    println!(
+                        "Session {id} was cancelled. Run `payjoin-cli cancel {id}` to cancel and broadcast the fallback transaction."
+                    );
+                    return Ok(());
+                }
+                ReceiveSession::Closed(_) => return Err(anyhow!("Session closed")),
             }
         };
-
-        match res {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let (_, session_history) = replay_receiver_event_log(persister)?;
-                let pj_uri = match session_history.pj_uri() {
-                    Some(uri) => Some(uri.extras.endpoint().clone()),
-                    None => None,
-                };
-                let ohttp_relay = self.unwrap_relay_or_else_fetch(pj_uri).await?;
-                handle_recoverable_error(&ohttp_relay, &session_history).await?;
-
-                Err(e)
-            }
-        }
+        res
     }
 
     #[allow(clippy::incompatible_msrv)]
@@ -348,12 +828,16 @@ impl App {
 
     async fn check_proposal(
         &self,
-        proposal: Receiver<UncheckedProposal>,
+        proposal: Receiver<UncheckedOriginalPayload>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
-            .check_broadcast_suitability(None, |tx| Ok(wallet.can_broadcast(tx)?))
+            .check_broadcast_suitability(None, |tx| {
+                wallet
+                    .can_broadcast(tx)
+                    .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
+            })
             .save(persister)?;
 
         println!("Fallback transaction received. Consider broadcasting this to get paid if the Payjoin fails:");
@@ -367,8 +851,13 @@ impl App {
         persister: &ReceiverPersister,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let proposal =
-            proposal.check_inputs_not_owned(|input| Ok(wallet.is_mine(input)?)).save(persister)?;
+        let proposal = proposal
+            .check_inputs_not_owned(&mut |input| {
+                wallet
+                    .is_mine(input)
+                    .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
+            })
+            .save(persister)?;
         self.check_no_inputs_seen_before(proposal, persister).await
     }
 
@@ -378,7 +867,9 @@ impl App {
         persister: &ReceiverPersister,
     ) -> Result<()> {
         let proposal = proposal
-            .check_no_inputs_seen_before(|input| Ok(self.db.insert_input_seen_before(*input)?))
+            .check_no_inputs_seen_before(&mut |input| {
+                Ok(self.db.insert_input_seen_before(*input)?)
+            })
             .save(persister)?;
         self.identify_receiver_outputs(proposal, persister).await
     }
@@ -390,7 +881,11 @@ impl App {
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
-            .identify_receiver_outputs(|output_script| Ok(wallet.is_mine(output_script)?))
+            .identify_receiver_outputs(&mut |output_script| {
+                wallet
+                    .is_mine(output_script)
+                    .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
+            })
             .save(persister)?;
         self.commit_outputs(proposal, persister).await
     }
@@ -412,9 +907,24 @@ impl App {
         let wallet = self.wallet();
         let candidate_inputs = wallet.list_unspent()?;
 
+        if candidate_inputs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No spendable UTXOs available in wallet. Cannot contribute inputs to payjoin."
+            ));
+        }
+
         let selected_input = proposal.try_preserving_privacy(candidate_inputs)?;
         let proposal =
             proposal.contribute_inputs(vec![selected_input])?.commit_inputs().save(persister)?;
+        self.apply_fee_range(proposal, persister).await
+    }
+
+    async fn apply_fee_range(
+        &self,
+        proposal: Receiver<WantsFeeRange>,
+        persister: &ReceiverPersister,
+    ) -> Result<()> {
+        let proposal = proposal.apply_fee_range(None, self.config.max_fee_rate).save(persister)?;
         self.finalize_proposal(proposal, persister).await
     }
 
@@ -425,37 +935,84 @@ impl App {
     ) -> Result<()> {
         let wallet = self.wallet();
         let proposal = proposal
-            .finalize_proposal(
-                |psbt| Ok(wallet.process_psbt(psbt)?),
-                None,
-                self.config.max_fee_rate,
-            )
+            .finalize_proposal(|psbt| {
+                wallet
+                    .process_psbt(psbt)
+                    .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
+            })
             .save(persister)?;
         self.send_payjoin_proposal(proposal, persister).await
     }
 
     async fn send_payjoin_proposal(
         &self,
-        mut proposal: Receiver<PayjoinProposal>,
+        proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
     ) -> Result<()> {
         let (req, ohttp_ctx) = proposal
-            .create_post_request(&self.unwrap_relay_or_else_fetch(None).await?)
+            .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
             .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
-        let res = post_request(req).await?;
+        let res = self.post_request(req).await?;
         let payjoin_psbt = proposal.psbt().clone();
-        proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
+        let session = proposal.process_response(&res.bytes().await?, ohttp_ctx).save(persister)?;
         println!(
             "Response successful. Watch mempool for successful Payjoin. TXID: {}",
             payjoin_psbt.extract_tx_unchecked_fee_rate().compute_txid()
         );
-        Ok(())
+
+        return self.monitor_payjoin_proposal(session, persister).await;
+    }
+
+    async fn monitor_payjoin_proposal(
+        &self,
+        proposal: Receiver<Monitor>,
+        persister: &ReceiverPersister,
+    ) -> Result<()> {
+        // On a session resumption, the receiver will resume again in this state.
+        let poll_interval = tokio::time::Duration::from_millis(200);
+        let timeout_duration = tokio::time::Duration::from_secs(5);
+
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.tick().await;
+
+        tracing::debug!("Polling for payment confirmation");
+
+        let result = tokio::time::timeout(timeout_duration, async {
+            loop {
+                interval.tick().await;
+                let check_result = proposal
+                    .check_payment(|txid| {
+                        self.wallet()
+                            .get_raw_transaction(&txid)
+                            .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
+                    })
+                    .save(persister);
+
+                match check_result {
+                    Ok(OptionalTransitionOutcome::Progress(())) => {
+                        println!("Payjoin transaction detected in the mempool!");
+                        return Ok(());
+                    }
+                    Ok(OptionalTransitionOutcome::Stasis(_)) => continue,
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(ok) => ok,
+            Err(_) => Err(anyhow!(
+                "No payjoin transaction detected in mempool within {timeout_duration:?}, stopping."
+            )),
+        }
     }
 
     async fn unwrap_relay_or_else_fetch(
         &self,
-        directory: Option<payjoin::Url>,
+        directory: Option<impl payjoin::IntoUrl>,
     ) -> Result<payjoin::Url> {
+        let directory = directory.map(|url| url.into_url()).transpose()?;
         let selected_relay =
             self.relay_manager.lock().expect("Lock should not be poisoned").get_selected_relay();
         let ohttp_relay = match selected_relay {
@@ -467,52 +1024,52 @@ impl App {
         };
         Ok(ohttp_relay)
     }
-}
 
-/// Handle request error by sending an error response over the directory
-async fn handle_recoverable_error(
-    ohttp_relay: &payjoin::Url,
-    session_history: &SessionHistory,
-) -> Result<()> {
-    let e = match session_history.terminal_error() {
-        Some((_, Some(e))) => e,
-        _ => return Ok(()),
-    };
-    let (err_req, err_ctx) = session_history
-        .extract_err_req(ohttp_relay)?
-        .expect("If JsonReply is Some, then err_req and err_ctx should be Some");
-    let to_return = anyhow!("Replied with error: {}", e.to_json().to_string());
+    /// Handle error by attempting to send an error response over the directory
+    async fn handle_error(
+        &self,
+        session: Receiver<HasReplyableError>,
+        persister: &ReceiverPersister,
+    ) -> Result<()> {
+        let (err_req, err_ctx) = session
+            .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
 
-    let err_response = match post_request(err_req).await {
-        Ok(response) => response,
-        Err(e) => return Err(anyhow!("Failed to post error request: {}", e)),
-    };
+        let err_response = match self.post_request(err_req).await {
+            Ok(response) => response,
+            Err(e) => return Err(anyhow!("Failed to post error request: {}", e)),
+        };
 
-    let err_bytes = match err_response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => return Err(anyhow!("Failed to get error response bytes: {}", e)),
-    };
+        let err_bytes = match err_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return Err(anyhow!("Failed to get error response bytes: {}", e)),
+        };
 
-    if let Err(e) = process_err_res(&err_bytes, err_ctx) {
-        return Err(anyhow!("Failed to process error response: {}", e));
+        if let Err(e) = session.process_error_response(&err_bytes, err_ctx).save(persister) {
+            if let Some(api_err) = e.api_error_ref() {
+                tracing::warn!("Failed to confirm error response delivery: {api_err}");
+            }
+            match e.error_state() {
+                Some(_) => {
+                    let id = persister.session_id();
+                    println!(
+                        "Session {id} failed. Run `payjoin-cli cancel {id}` to cancel and broadcast the fallback transaction."
+                    );
+                }
+                None => return Err(anyhow!("Failed to process error response")),
+            }
+        }
+
+        Ok(())
     }
 
-    Err(to_return)
-}
-
-async fn post_request(req: payjoin::Request) -> Result<reqwest::Response> {
-    let http = http_agent()?;
-    http.post(req.url)
-        .header("Content-Type", req.content_type)
-        .body(req.body)
-        .send()
-        .await
-        .map_err(map_reqwest_err)
-}
-
-fn map_reqwest_err(e: reqwest::Error) -> anyhow::Error {
-    match e.status() {
-        Some(status_code) => anyhow!("HTTP request failed: {} {}", status_code, e),
-        None => anyhow!("No HTTP response: {}", e),
+    async fn post_request(&self, req: payjoin::Request) -> Result<reqwest::Response> {
+        let http = http_agent(&self.config)?;
+        http.post(req.url)
+            .header("Content-Type", req.content_type)
+            .body(req.body)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .context("HTTP request failed")
     }
 }

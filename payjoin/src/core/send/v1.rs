@@ -21,51 +21,58 @@
 //! [`bitmask-core`](https://github.com/diba-io/bitmask-core) BDK integration. Bring your own
 //! wallet and http client.
 
+use std::str::FromStr;
+
 use bitcoin::psbt::Psbt;
-use bitcoin::{FeeRate, ScriptBuf, Weight};
-use error::{BuildSenderError, InternalBuildSenderError};
-use url::Url;
+use bitcoin::{Address, Amount, FeeRate};
+use error::BuildSenderError;
 
 use super::*;
 pub use crate::output_substitution::OutputSubstitution;
-use crate::psbt::PsbtExt;
+use crate::uri::v1::PjParam;
 use crate::{PjUri, Request, MAX_CONTENT_LENGTH};
 
 /// A builder to construct the properties of a `Sender`.
 #[derive(Clone)]
-pub struct SenderBuilder<'a> {
-    pub(crate) psbt: Psbt,
-    pub(crate) uri: PjUri<'a>,
+pub struct SenderBuilder {
+    pub(crate) endpoint: Url,
     pub(crate) output_substitution: OutputSubstitution,
-    pub(crate) fee_contribution: Option<(bitcoin::Amount, Option<usize>)>,
-    /// Decreases the fee contribution instead of erroring.
-    ///
-    /// If this option is true and a transaction with change amount lower than fee
-    /// contribution is provided then instead of returning error the fee contribution will
-    /// be just lowered in the request to match the change amount.
-    pub(crate) clamp_fee_contribution: bool,
-    pub(crate) min_fee_rate: FeeRate,
+    pub(crate) psbt_ctx_builder: PsbtContextBuilder,
 }
 
-/// We only need to add the weight of the txid: 32, index: 4 and sequence: 4 as rust_bitcoin
-/// already accounts for the scriptsig length when calculating InputWeightPrediction
-/// <https://docs.rs/bitcoin/latest/src/bitcoin/blockdata/transaction.rs.html#1621>
-const NON_WITNESS_INPUT_WEIGHT: bitcoin::Weight = Weight::from_non_witness_data_size(32 + 4 + 4);
-
-impl<'a> SenderBuilder<'a> {
+impl SenderBuilder {
     /// Prepare the context from which to make Sender requests
     ///
     /// Call [`SenderBuilder::build_recommended()`] or other `build` methods
     /// to create a [`Sender`]
-    pub fn new(psbt: Psbt, uri: PjUri<'a>) -> Self {
+    pub fn new(psbt: Psbt, uri: PjUri) -> Self {
         Self {
-            psbt,
-            uri,
-            // Sender's optional parameters
+            endpoint: uri.extras.pj_param.endpoint_url(),
+            // Adopt the output substitution preference from the URI
+            output_substitution: uri.extras.output_substitution,
+            psbt_ctx_builder: PsbtContextBuilder::new(
+                psbt,
+                uri.address.script_pubkey(),
+                uri.amount,
+            ),
+        }
+    }
+
+    /// Create a [SenderBuilder] from component parts to mirror [crate::send::v2::SenderBuilder::from_parts]
+    ///
+    /// This method allows constructing a v1 [SenderBuilder] using a [PjParam] directly,
+    /// rather than requiring a full [PjUri].
+    pub fn from_parts(
+        psbt: Psbt,
+        pj_param: &PjParam,
+        address: &Address,
+        amount: Option<Amount>,
+    ) -> Self {
+        Self {
+            endpoint: pj_param.endpoint(),
+            // Default to enabled output substitution for v1 when not specified via URI
             output_substitution: OutputSubstitution::Enabled,
-            fee_contribution: None,
-            clamp_fee_contribution: false,
-            min_fee_rate: FeeRate::ZERO,
+            psbt_ctx_builder: PsbtContextBuilder::new(psbt, address.script_pubkey(), amount),
         }
     }
 
@@ -75,9 +82,8 @@ impl<'a> SenderBuilder<'a> {
     /// It is generally **not** recommended to set this as it may prevent the receiver from
     /// doing advanced operations such as opening LN channels and it also guarantees the
     /// receiver will **not** reward the sender with a discount.
-    pub fn always_disable_output_substitution(mut self) -> Self {
-        self.output_substitution = OutputSubstitution::Disabled;
-        self
+    pub fn always_disable_output_substitution(self) -> Self {
+        Self { output_substitution: OutputSubstitution::Disabled, ..self }
     }
 
     // Calculate the recommended fee contribution for an Original PSBT.
@@ -87,61 +93,12 @@ impl<'a> SenderBuilder<'a> {
     //
     // This method fails if no recommendation can be made or if the PSBT is malformed.
     pub fn build_recommended(self, min_fee_rate: FeeRate) -> Result<Sender, BuildSenderError> {
-        // TODO support optional batched payout scripts. This would require a change to
-        // build() which now checks for a single payee.
-        let mut payout_scripts = std::iter::once(self.uri.address.script_pubkey());
-
-        // Check if the PSBT is a sweep transaction with only one output that's a payout script and no change
-        if self.psbt.unsigned_tx.output.len() == 1
-            && payout_scripts.all(|script| script == self.psbt.unsigned_tx.output[0].script_pubkey)
-        {
-            return self.build_non_incentivizing(min_fee_rate);
-        }
-
-        if let Some((additional_fee_index, fee_available)) = self
-            .psbt
-            .unsigned_tx
-            .output
-            .clone()
-            .into_iter()
-            .enumerate()
-            .find(|(_, txo)| payout_scripts.all(|script| script != txo.script_pubkey))
-            .map(|(i, txo)| (i, txo.value))
-        {
-            let mut input_pairs = self.psbt.input_pairs();
-            let first_input_pair = input_pairs.next().ok_or(InternalBuildSenderError::NoInputs)?;
-            let mut input_weight = first_input_pair
-                .expected_input_weight()
-                .map_err(InternalBuildSenderError::InputWeight)?;
-            for input_pair in input_pairs {
-                // use cheapest default if mixed input types
-                if input_pair.address_type()? != first_input_pair.address_type()? {
-                    input_weight =
-                        bitcoin::transaction::InputWeightPrediction::P2TR_KEY_NON_DEFAULT_SIGHASH
-                            .weight()
-                            + NON_WITNESS_INPUT_WEIGHT;
-                    break;
-                }
-            }
-
-            let recommended_additional_fee = min_fee_rate * input_weight;
-            if fee_available < recommended_additional_fee {
-                log::warn!("Insufficient funds to maintain specified minimum feerate.");
-                return self.build_with_additional_fee(
-                    fee_available,
-                    Some(additional_fee_index),
-                    min_fee_rate,
-                    true,
-                );
-            }
-            return self.build_with_additional_fee(
-                recommended_additional_fee,
-                Some(additional_fee_index),
-                min_fee_rate,
-                false,
-            );
-        }
-        self.build_non_incentivizing(min_fee_rate)
+        Ok(Sender {
+            endpoint: self.endpoint,
+            psbt_ctx: self
+                .psbt_ctx_builder
+                .build_recommended(min_fee_rate, self.output_substitution)?,
+        })
     }
 
     /// Offer the receiver contribution to pay for his input.
@@ -158,16 +115,22 @@ impl<'a> SenderBuilder<'a> {
     /// contribution is provided then instead of returning error the fee contribution will
     /// be just lowered in the request to match the change amount.
     pub fn build_with_additional_fee(
-        mut self,
+        self,
         max_fee_contribution: bitcoin::Amount,
         change_index: Option<usize>,
         min_fee_rate: FeeRate,
         clamp_fee_contribution: bool,
     ) -> Result<Sender, BuildSenderError> {
-        self.fee_contribution = Some((max_fee_contribution, change_index));
-        self.clamp_fee_contribution = clamp_fee_contribution;
-        self.min_fee_rate = min_fee_rate;
-        self.build()
+        Ok(Sender {
+            endpoint: self.endpoint,
+            psbt_ctx: self.psbt_ctx_builder.build_with_additional_fee(
+                max_fee_contribution,
+                change_index,
+                min_fee_rate,
+                clamp_fee_contribution,
+                self.output_substitution,
+            )?,
+        })
     }
 
     /// Perform Payjoin without incentivizing the payee to cooperate.
@@ -175,62 +138,27 @@ impl<'a> SenderBuilder<'a> {
     /// While it's generally better to offer some contribution some users may wish not to.
     /// This function disables contribution.
     pub fn build_non_incentivizing(
-        mut self,
+        self,
         min_fee_rate: FeeRate,
     ) -> Result<Sender, BuildSenderError> {
-        // since this is a builder, these should already be cleared
-        // but we'll reset them to be sure
-        self.fee_contribution = None;
-        self.clamp_fee_contribution = false;
-        self.min_fee_rate = min_fee_rate;
-        self.build()
-    }
-
-    fn build(self) -> Result<Sender, BuildSenderError> {
-        let mut psbt =
-            self.psbt.validate().map_err(InternalBuildSenderError::InconsistentOriginalPsbt)?;
-        psbt.validate_input_utxos().map_err(InternalBuildSenderError::InvalidOriginalInput)?;
-        let endpoint = self.uri.extras.endpoint.clone();
-        let output_substitution =
-            self.uri.extras.output_substitution.combine(self.output_substitution);
-        let payee = self.uri.address.script_pubkey();
-
-        check_single_payee(&psbt, &payee, self.uri.amount)?;
-        let fee_contribution = determine_fee_contribution(
-            &psbt,
-            &payee,
-            self.fee_contribution,
-            self.clamp_fee_contribution,
-        )?;
-        clear_unneeded_fields(&mut psbt);
-
         Ok(Sender {
-            psbt,
-            endpoint,
-            output_substitution,
-            fee_contribution,
-            payee,
-            min_fee_rate: self.min_fee_rate,
+            endpoint: self.endpoint,
+            psbt_ctx: self
+                .psbt_ctx_builder
+                .build_non_incentivizing(min_fee_rate, self.output_substitution)?,
         })
     }
 }
 
 /// A payjoin V1 sender, allowing the construction of a payjoin V1 request
 /// and the resulting `V1Context`
-#[derive(Clone, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "v2", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "v2", derive(PartialEq, Eq, serde::Serialize, serde::Deserialize))]
 pub struct Sender {
-    /// The original PSBT.
-    pub(crate) psbt: Psbt,
     /// The endpoint in the Payjoin URI
     pub(crate) endpoint: Url,
-    /// Whether the receiver is allowed to substitute original outputs.
-    pub(crate) output_substitution: OutputSubstitution,
-    /// (maxadditionalfeecontribution, additionalfeeoutputindex)
-    pub(crate) fee_contribution: Option<AdditionalFeeContribution>,
-    pub(crate) min_fee_rate: FeeRate,
-    /// Script of the person being paid
-    pub(crate) payee: ScriptBuf,
+    /// The original PSBT.
+    pub(crate) psbt_ctx: PsbtContext,
 }
 
 impl Sender {
@@ -238,28 +166,30 @@ impl Sender {
     pub fn create_v1_post_request(&self) -> (Request, V1Context) {
         let url = serialize_url(
             self.endpoint.clone(),
-            self.output_substitution,
-            self.fee_contribution,
-            self.min_fee_rate,
-            "1", // payjoin version
+            self.psbt_ctx.output_substitution,
+            self.psbt_ctx.fee_contribution,
+            self.psbt_ctx.min_fee_rate,
+            Version::One,
         );
-        let body = self.psbt.to_string().as_bytes().to_vec();
+        let mut sanitized_psbt = self.psbt_ctx.original_psbt.clone();
+        clear_unneeded_fields(&mut sanitized_psbt);
+        let body = sanitized_psbt.to_string().as_bytes().to_vec();
         (
             Request::new_v1(&url, &body),
             V1Context {
                 psbt_context: PsbtContext {
-                    original_psbt: self.psbt.clone(),
-                    output_substitution: self.output_substitution,
-                    fee_contribution: self.fee_contribution,
-                    payee: self.payee.clone(),
-                    min_fee_rate: self.min_fee_rate,
+                    original_psbt: self.psbt_ctx.original_psbt.clone(),
+                    output_substitution: self.psbt_ctx.output_substitution,
+                    fee_contribution: self.psbt_ctx.fee_contribution,
+                    payee: self.psbt_ctx.payee.clone(),
+                    min_fee_rate: self.psbt_ctx.min_fee_rate,
                 },
             },
         )
     }
 
     /// The endpoint in the Payjoin URI
-    pub fn endpoint(&self) -> &Url { &self.endpoint }
+    pub fn endpoint(&self) -> String { self.endpoint.to_string() }
 }
 
 /// Data required to validate the response.
@@ -276,7 +206,6 @@ impl V1Context {
     ///
     /// Call this method with response from receiver to continue BIP78 flow. If the response is
     /// valid you will get appropriate PSBT that you should sign and broadcast.
-    #[inline]
     pub fn process_response(self, response: &[u8]) -> Result<Psbt, ResponseError> {
         if response.len() > MAX_CONTENT_LENGTH {
             return Err(ResponseError::from(InternalValidationError::ContentTooLarge));
@@ -288,19 +217,37 @@ impl V1Context {
     }
 }
 
+impl ResponseError {
+    /// Parse a response from the receiver.
+    ///
+    /// response must be valid JSON string.
+    pub(crate) fn parse(response: &str) -> Self {
+        match serde_json::from_str(response) {
+            Ok(json) => Self::from_json(json),
+            Err(_) => InternalValidationError::Parse.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use bitcoin::FeeRate;
+    use std::collections::BTreeMap;
+
+    use bitcoin::bip32::{self, DerivationPath};
+    use bitcoin::hex::FromHex;
+    use bitcoin::key::Secp256k1;
+    use bitcoin::psbt::raw::ProprietaryKey;
+    use bitcoin::{psbt, FeeRate, NetworkKind, XOnlyPublicKey};
     use payjoin_test_utils::{
-        BoxError, INVALID_PSBT, MULTIPARTY_ORIGINAL_PSBT_ONE, PARSED_ORIGINAL_PSBT,
-        PAYJOIN_PROPOSAL,
+        BoxError, EXAMPLE_URL, INVALID_PSBT, MULTIPARTY_ORIGINAL_PSBT_ONE, PARSED_ORIGINAL_PSBT,
+        PARSED_PAYJOIN_PROPOSAL_WITH_SENDER_INFO, PAYJOIN_PROPOSAL,
     };
 
     use super::*;
     use crate::error_codes::ErrorCode;
     use crate::send::error::{ResponseError, WellKnownError};
     use crate::send::test::create_psbt_context;
-    use crate::{Uri, UriExt};
+    use crate::{Uri, UriExt, MAX_CONTENT_LENGTH};
 
     const PJ_URI: &str =
         "bitcoin:2N47mmrWXsNBvQR6k78hWJoTji57zXwNcU7?amount=0.02&pjos=0&pj=HTTPS://EXAMPLE.COM/";
@@ -316,6 +263,60 @@ mod test {
     fn create_v1_context() -> super::V1Context {
         let psbt_context = create_psbt_context().expect("failed to create context");
         super::V1Context { psbt_context }
+    }
+
+    #[test]
+    fn test_clear_unneeded_fields() -> Result<(), BoxError> {
+        let mut proposal = PARSED_PAYJOIN_PROPOSAL_WITH_SENDER_INFO.clone();
+        let payee = proposal.unsigned_tx.output[1].script_pubkey.clone();
+        let x_only_key = XOnlyPublicKey::from_str(
+            "4f65949efe60e5be80cf171c06144641e832815de4f6ab3fe0257351aeb22a84",
+        )?;
+        let _ = proposal.inputs[0].tap_internal_key.insert(x_only_key);
+        let _ = proposal.outputs[0].tap_internal_key.insert(x_only_key);
+        assert!(proposal.inputs[0].tap_internal_key.is_some());
+        assert!(!proposal.inputs[0].bip32_derivation.is_empty());
+        assert!(proposal.outputs[0].tap_internal_key.is_some());
+        assert!(!proposal.outputs[0].bip32_derivation.is_empty());
+        let mut psbt_ctx = PsbtContextBuilder::new(proposal.clone(), payee, None)
+            .build(OutputSubstitution::Disabled)?;
+
+        let mut map = BTreeMap::new();
+        let secp = Secp256k1::new();
+        let seed = Vec::<u8>::from_hex("BEEFCAFE").unwrap();
+        let xpriv = bip32::Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
+        let xpub: bip32::Xpub = bip32::Xpub::from_priv(&secp, &xpriv);
+        let value = (xpriv.fingerprint(&secp), DerivationPath::from_str("42'").unwrap());
+        map.insert(xpub, value);
+        psbt_ctx.original_psbt.xpub = map;
+
+        let mut map = BTreeMap::new();
+        let proprietary_key =
+            ProprietaryKey { prefix: b"mock_prefix".to_vec(), subtype: 0x00, key: vec![] };
+        let value = FromHex::from_hex("BEEFCAFE").unwrap();
+        map.insert(proprietary_key, value);
+        psbt_ctx.original_psbt.proprietary = map;
+
+        let mut map = BTreeMap::new();
+        let unknown_key: psbt::raw::Key = psbt::raw::Key { type_value: 0x00, key: vec![] };
+        let value = FromHex::from_hex("BEEFCAFE").unwrap();
+        map.insert(unknown_key, value);
+        psbt_ctx.original_psbt.unknown = map;
+
+        let sender = Sender { endpoint: Url::from_str(EXAMPLE_URL)?, psbt_ctx };
+        assert_eq!(Url::parse(&sender.endpoint()), Url::parse(EXAMPLE_URL));
+
+        let body = sender.create_v1_post_request().0.body;
+        let res_str = std::str::from_utf8(&body)?;
+        let proposal = Psbt::from_str(res_str)?;
+        assert!(proposal.inputs[0].tap_internal_key.is_none());
+        assert!(proposal.inputs[0].bip32_derivation.is_empty());
+        assert!(proposal.outputs[0].tap_internal_key.is_none());
+        assert!(proposal.outputs[0].bip32_derivation.is_empty());
+        assert!(proposal.xpub.is_empty());
+        assert!(proposal.proprietary.is_empty());
+        assert!(proposal.unknown.is_empty());
+        Ok(())
     }
 
     /// This test adds mutation coverage for build_recommended when the outputs are equal to the
@@ -340,7 +341,10 @@ mod test {
         )
         .build_recommended(FeeRate::MIN);
         assert!(sender.is_ok(), "{:#?}", sender.err());
-        assert_eq!(sender.unwrap().fee_contribution.unwrap().max_amount, Amount::from_sat(0));
+        assert_eq!(
+            sender.unwrap().psbt_ctx.fee_contribution.unwrap().max_amount,
+            Amount::from_sat(0)
+        );
 
         Ok(())
     }
@@ -365,7 +369,10 @@ mod test {
         )
         .build_recommended(FeeRate::MIN);
         assert!(sender.is_ok(), "{:#?}", sender.err());
-        assert_eq!(sender.unwrap().fee_contribution.unwrap().max_amount, Amount::from_sat(0));
+        assert_eq!(
+            sender.unwrap().psbt_ctx.fee_contribution.unwrap().max_amount,
+            Amount::from_sat(0)
+        );
 
         let mut psbt = Psbt::from_str(MULTIPARTY_ORIGINAL_PSBT_ONE).unwrap();
         psbt.unsigned_tx.input.pop();
@@ -381,7 +388,7 @@ mod test {
         .build_recommended(FeeRate::from_sat_per_vb(170000000).expect("Could not determine feerate"));
         assert!(sender.is_ok(), "{:#?}", sender.err());
         assert_eq!(
-            sender.unwrap().fee_contribution.unwrap().max_amount,
+            sender.unwrap().psbt_ctx.fee_contribution.unwrap().max_amount,
             Amount::from_sat(9999999822)
         );
 
@@ -396,12 +403,13 @@ mod test {
                 FeeRate::from_sat_per_vb(2000000).expect("Could not determine feerate"),
             )
             .expect("sender should succeed");
-        assert_eq!(sender.output_substitution, OutputSubstitution::Disabled);
-        assert_eq!(&sender.payee, &pj_uri().address.script_pubkey());
-        let fee_contribution = sender.fee_contribution.expect("sender should contribute fees");
+        assert_eq!(sender.psbt_ctx.output_substitution, OutputSubstitution::Disabled);
+        assert_eq!(&sender.psbt_ctx.payee, &pj_uri().address.script_pubkey());
+        let fee_contribution =
+            sender.psbt_ctx.fee_contribution.expect("sender should contribute fees");
         assert_eq!(fee_contribution.max_amount, psbt.unsigned_tx.output[0].value);
         assert_eq!(fee_contribution.vout, 0);
-        assert_eq!(sender.min_fee_rate, FeeRate::from_sat_per_kwu(500000000));
+        assert_eq!(sender.psbt_ctx.min_fee_rate, FeeRate::from_sat_per_kwu(500000000));
     }
 
     #[test]
@@ -409,19 +417,20 @@ mod test {
         let sender = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri())
             .build_recommended(FeeRate::BROADCAST_MIN)
             .expect("sender should succeed");
-        assert_eq!(sender.output_substitution, OutputSubstitution::Disabled);
-        assert_eq!(&sender.payee, &pj_uri().address.script_pubkey());
-        let fee_contribution = sender.fee_contribution.expect("sender should contribute fees");
+        assert_eq!(sender.psbt_ctx.output_substitution, OutputSubstitution::Disabled);
+        assert_eq!(&sender.psbt_ctx.payee, &pj_uri().address.script_pubkey());
+        let fee_contribution =
+            sender.psbt_ctx.fee_contribution.expect("sender should contribute fees");
         assert_eq!(fee_contribution.max_amount, Amount::from_sat(91));
         assert_eq!(fee_contribution.vout, 0);
-        assert_eq!(sender.min_fee_rate, FeeRate::from_sat_per_kwu(250));
+        assert_eq!(sender.psbt_ctx.min_fee_rate, FeeRate::from_sat_per_kwu(250));
         // Ensure the receiver's output substitution preference is respected either way
         let mut pj_uri = pj_uri();
         pj_uri.extras.output_substitution = OutputSubstitution::Enabled;
         let sender = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri)
-            .build_recommended(FeeRate::from_sat_per_vb_unchecked(1))
+            .build_recommended(FeeRate::from_sat_per_vb_u32(1))
             .expect("sender should succeed");
-        assert_eq!(sender.output_substitution, OutputSubstitution::Enabled);
+        assert_eq!(sender.psbt_ctx.output_substitution, OutputSubstitution::Enabled);
     }
 
     #[test]
@@ -479,11 +488,14 @@ mod test {
 
     #[test]
     fn process_response_invalid_utf8() {
-        // In UTF-8, 0xF0 represents the start of a 4-byte sequence, so 0xF0 by itself is invalid
-        let invalid_utf8 = &[0xF0];
+        // A PSBT expects an exact match so padding with null bytes for the from_str method is
+        // invalid
+        let mut invalid_utf8_padding = PAYJOIN_PROPOSAL.as_bytes().to_vec();
+        invalid_utf8_padding
+            .extend(std::iter::repeat_n(0x00, MAX_CONTENT_LENGTH - invalid_utf8_padding.len()));
 
         let ctx = create_v1_context();
-        let response = ctx.process_response(invalid_utf8);
+        let response = ctx.process_response(&invalid_utf8_padding);
         match response {
             Ok(_) => panic!("Invalid UTF-8 should have caused an error"),
             Err(error) => match error {
@@ -501,7 +513,7 @@ mod test {
     #[test]
     fn process_response_invalid_buffer_len() {
         let mut data = PAYJOIN_PROPOSAL.as_bytes().to_vec();
-        data.extend(std::iter::repeat(0).take(MAX_CONTENT_LENGTH + 1));
+        data.extend(std::iter::repeat_n(0, MAX_CONTENT_LENGTH + 1));
 
         let ctx = create_v1_context();
         let response = ctx.process_response(&data);
@@ -517,5 +529,15 @@ mod test {
                 _ => panic!("Unexpected error type"),
             },
         }
+    }
+
+    #[test]
+    fn test_max_content_length() {
+        assert_eq!(MAX_CONTENT_LENGTH, 4_000_000 * 4 / 3);
+    }
+
+    #[test]
+    fn test_non_witness_input_weight_const() {
+        assert_eq!(NON_WITNESS_INPUT_WEIGHT, bitcoin::Weight::from_wu(160));
     }
 }

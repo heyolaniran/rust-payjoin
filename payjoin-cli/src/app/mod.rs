@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
-use bitcoincore_rpc::bitcoin::Amount;
+use anyhow::Result;
 use payjoin::bitcoin::psbt::Psbt;
-use payjoin::bitcoin::FeeRate;
-use payjoin::{bitcoin, PjUri};
+use payjoin::bitcoin::{self, Address, Amount, FeeRate};
 use tokio::signal;
 use tokio::sync::watch;
 
@@ -12,18 +10,19 @@ pub mod config;
 pub mod wallet;
 use crate::app::config::Config;
 use crate::app::wallet::BitcoindWallet;
+#[cfg(feature = "v2")]
+use crate::cli::Role;
+#[cfg(feature = "v2")]
+use crate::db::v2::SessionId;
 
 #[cfg(feature = "v1")]
 pub(crate) mod v1;
 #[cfg(feature = "v2")]
 pub(crate) mod v2;
 
-#[cfg(feature = "_danger-local-https")]
-pub const LOCAL_CERT_FILE: &str = "localhost.der";
-
 #[async_trait::async_trait]
 pub trait App: Send + Sync {
-    fn new(config: Config) -> Result<Self>
+    async fn new(config: Config) -> Result<Self>
     where
         Self: Sized;
     fn wallet(&self) -> BitcoindWallet;
@@ -31,22 +30,41 @@ pub trait App: Send + Sync {
     async fn receive_payjoin(&self, amount: Amount) -> Result<()>;
     #[cfg(feature = "v2")]
     async fn resume_payjoins(&self) -> Result<()>;
+    #[cfg(feature = "v2")]
+    async fn history(&self) -> Result<()>;
+    #[cfg(feature = "v2")]
+    async fn cancel(
+        &self,
+        session_id: SessionId,
+        no_broadcast: bool,
+        role: Option<Role>,
+    ) -> Result<()>;
 
-    fn create_original_psbt(&self, uri: &PjUri, fee_rate: FeeRate) -> Result<Psbt> {
-        let amount = uri.amount.ok_or_else(|| anyhow!("please specify the amount in the Uri"))?;
+    fn create_original_psbt(
+        &self,
+        address: &Address,
+        amount: Amount,
+        fee_rate: FeeRate,
+    ) -> Result<Psbt> {
+        // Check if wallet has spendable UTXOs before attempting to create PSBT
+        if !self.wallet().has_spendable_utxos()? {
+            return Err(anyhow::anyhow!(
+                "No spendable UTXOs available in wallet. Please ensure your wallet has confirmed funds."
+            ));
+        }
 
         // wallet_create_funded_psbt requires a HashMap<address: String, Amount>
         let mut outputs = HashMap::with_capacity(1);
-        outputs.insert(uri.address.to_string(), amount);
+        outputs.insert(address.to_string(), amount);
 
         self.wallet().create_psbt(outputs, fee_rate, true)
     }
 
     fn process_pj_response(&self, psbt: Psbt) -> Result<bitcoin::Txid> {
-        log::debug!("Proposed psbt: {psbt:#?}");
+        tracing::trace!("Proposed psbt: {psbt:#?}");
 
         let signed = self.wallet().process_psbt(&psbt)?;
-        let tx = self.wallet().finalize_psbt(&signed)?;
+        let tx = signed.extract_tx()?;
 
         let txid = self.wallet().broadcast_tx(&tx)?;
 
@@ -55,30 +73,28 @@ pub trait App: Send + Sync {
     }
 }
 
-#[cfg(feature = "_danger-local-https")]
-fn http_agent() -> Result<reqwest::Client> { Ok(http_agent_builder()?.build()?) }
-
-#[cfg(not(feature = "_danger-local-https"))]
-fn http_agent() -> Result<reqwest::Client> { Ok(reqwest::Client::new()) }
-
-#[cfg(feature = "_danger-local-https")]
-fn http_agent_builder() -> Result<reqwest::ClientBuilder> {
-    use rustls::pki_types::CertificateDer;
-    use rustls::RootCertStore;
-
-    let cert_der = read_local_cert()?;
-    let mut root_cert_store = RootCertStore::empty();
-    root_cert_store.add(CertificateDer::from(cert_der.as_slice()))?;
-    Ok(reqwest::ClientBuilder::new()
-        .use_rustls_tls()
-        .add_root_certificate(reqwest::tls::Certificate::from_der(cert_der.as_slice())?))
+#[cfg(feature = "_manual-tls")]
+fn http_agent(config: &Config) -> Result<reqwest::Client> {
+    Ok(http_agent_builder(config.root_certificate.as_ref())?.build()?)
 }
 
-#[cfg(feature = "_danger-local-https")]
-fn read_local_cert() -> Result<Vec<u8>> {
-    let mut local_cert_path = std::env::temp_dir();
-    local_cert_path.push(LOCAL_CERT_FILE);
-    Ok(std::fs::read(local_cert_path)?)
+#[cfg(not(feature = "_manual-tls"))]
+fn http_agent(_config: &Config) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().http1_only().build()?)
+}
+
+#[cfg(feature = "_manual-tls")]
+fn http_agent_builder(
+    root_cert_path: Option<&std::path::PathBuf>,
+) -> Result<reqwest::ClientBuilder> {
+    let mut builder = reqwest::ClientBuilder::new().use_rustls_tls().http1_only();
+
+    if let Some(root_cert_path) = root_cert_path {
+        let cert_der = std::fs::read(root_cert_path)?;
+        builder =
+            builder.add_root_certificate(reqwest::tls::Certificate::from_der(cert_der.as_slice())?)
+    }
+    Ok(builder)
 }
 
 async fn handle_interrupt(tx: watch::Sender<()>) {

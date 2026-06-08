@@ -1,4 +1,4 @@
-use std::fmt::{self, Display};
+use std::fmt;
 use std::str::FromStr;
 
 use bitcoin::locktime::absolute::LockTime;
@@ -6,7 +6,6 @@ use bitcoin::transaction::Version;
 use bitcoin::Sequence;
 
 use crate::error_codes::ErrorCode;
-use crate::MAX_CONTENT_LENGTH;
 
 /// Error building a Sender from a SenderBuilder.
 ///
@@ -95,10 +94,11 @@ pub struct ValidationError(InternalValidationError);
 #[derive(Debug)]
 pub(crate) enum InternalValidationError {
     Parse,
+    #[cfg(feature = "v1")]
     ContentTooLarge,
     Proposal(InternalProposalError),
     #[cfg(feature = "v2")]
-    V2Encapsulation(crate::send::v2::EncapsulationError),
+    V2Decapsulation(crate::send::v2::DecapsulationError),
 }
 
 impl From<InternalValidationError> for ValidationError {
@@ -119,10 +119,14 @@ impl fmt::Display for ValidationError {
 
         match &self.0 {
             Parse => write!(f, "couldn't decode as PSBT or JSON",),
-            ContentTooLarge => write!(f, "content is larger than {MAX_CONTENT_LENGTH} bytes"),
+            #[cfg(feature = "v1")]
+            ContentTooLarge => {
+                use crate::MAX_CONTENT_LENGTH;
+                write!(f, "content is larger than {MAX_CONTENT_LENGTH} bytes")
+            }
             Proposal(e) => write!(f, "proposal PSBT error: {e}"),
             #[cfg(feature = "v2")]
-            V2Encapsulation(e) => write!(f, "v2 encapsulation error: {e}"),
+            V2Decapsulation(e) => write!(f, "v2 encapsulation error: {e}"),
         }
     }
 }
@@ -133,10 +137,11 @@ impl std::error::Error for ValidationError {
 
         match &self.0 {
             Parse => None,
+            #[cfg(feature = "v1")]
             ContentTooLarge => None,
             Proposal(e) => Some(e),
             #[cfg(feature = "v2")]
-            V2Encapsulation(e) => Some(e),
+            V2Decapsulation(e) => Some(e),
         }
     }
 }
@@ -246,6 +251,7 @@ impl std::error::Error for InternalProposalError {
 }
 
 /// Represent an error returned by Payjoin receiver.
+#[non_exhaustive]
 pub enum ResponseError {
     /// `WellKnown` Errors are defined in the [`BIP78::ReceiverWellKnownError`] spec.
     ///
@@ -266,46 +272,6 @@ pub enum ResponseError {
     Unrecognized { error_code: String, message: String },
 }
 
-impl ResponseError {
-    pub(crate) fn from_json(json: serde_json::Value) -> Self {
-        let message = json
-            .as_object()
-            .and_then(|v| v.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let error_code = json.as_object().and_then(|v| v.get("errorCode")).and_then(|v| v.as_str());
-
-        match error_code {
-            Some(code) => match ErrorCode::from_str(code) {
-                Ok(ErrorCode::VersionUnsupported) => {
-                    let supported = json
-                        .as_object()
-                        .and_then(|v| v.get("supported"))
-                        .and_then(|v| v.as_array())
-                        .map(|array| array.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>())
-                        .unwrap_or_default();
-                    WellKnownError::version_unsupported(message, supported).into()
-                }
-                Ok(code) => WellKnownError::new(code, message).into(),
-                Err(_) => Self::Unrecognized { error_code: code.to_string(), message },
-            },
-            None => InternalValidationError::Parse.into(),
-        }
-    }
-
-    /// Parse a response from the receiver.
-    ///
-    /// response must be valid JSON string.
-    pub(crate) fn parse(response: &str) -> Self {
-        match serde_json::from_str(response) {
-            Ok(json) => Self::from_json(json),
-            Err(_) => InternalValidationError::Parse.into(),
-        }
-    }
-}
-
 impl std::error::Error for ResponseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         use ResponseError::*;
@@ -318,10 +284,6 @@ impl std::error::Error for ResponseError {
     }
 }
 
-impl From<WellKnownError> for ResponseError {
-    fn from(value: WellKnownError) -> Self { Self::WellKnown(value) }
-}
-
 impl From<InternalValidationError> for ResponseError {
     fn from(value: InternalValidationError) -> Self { Self::Validation(ValidationError(value)) }
 }
@@ -332,7 +294,7 @@ impl From<InternalProposalError> for ResponseError {
     }
 }
 
-impl Display for ResponseError {
+impl fmt::Display for ResponseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::WellKnown(e) => e.fmt(f),
@@ -367,24 +329,42 @@ impl fmt::Debug for ResponseError {
     }
 }
 
+impl ResponseError {
+    pub(crate) fn from_json(json: serde_json::Value) -> Self {
+        let message = json
+            .as_object()
+            .and_then(|v| v.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let error_code = json.as_object().and_then(|v| v.get("errorCode")).and_then(|v| v.as_str());
+
+        match error_code {
+            Some(code) => match ErrorCode::from_str(code) {
+                Ok(ErrorCode::VersionUnsupported) => {
+                    let supported = json
+                        .as_object()
+                        .and_then(|v| v.get("supported"))
+                        .and_then(|v| v.as_array())
+                        .map(|array| array.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>())
+                        .unwrap_or_default();
+                    WellKnownError::version_unsupported(message, supported).into()
+                }
+                Ok(code) => WellKnownError::new(code, message).into(),
+                Err(_) => Self::Unrecognized { error_code: code.to_string(), message },
+            },
+            None => InternalValidationError::Parse.into(),
+        }
+    }
+}
+
 /// A well-known error that can be safely displayed to end users.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WellKnownError {
     pub(crate) code: ErrorCode,
     pub(crate) message: String,
     pub(crate) supported_versions: Option<Vec<u64>>,
-}
-
-impl WellKnownError {
-    /// Create a new well-known error with the given code and message.
-    pub(crate) fn new(code: ErrorCode, message: String) -> Self {
-        Self { code, message, supported_versions: None }
-    }
-
-    /// Create a version unsupported error with the given message and supported versions.
-    pub(crate) fn version_unsupported(message: String, supported: Vec<u64>) -> Self {
-        Self { code: ErrorCode::VersionUnsupported, message, supported_versions: Some(supported) }
-    }
 }
 
 impl std::error::Error for WellKnownError {}
@@ -406,18 +386,36 @@ impl core::fmt::Display for WellKnownError {
     }
 }
 
+impl From<WellKnownError> for ResponseError {
+    fn from(value: WellKnownError) -> Self { Self::WellKnown(value) }
+}
+
+impl WellKnownError {
+    /// Return the well-known BIP-78 error code.
+    pub fn code(&self) -> ErrorCode { self.code }
+
+    /// Create a new well-known error with the given code and message.
+    pub(crate) fn new(code: ErrorCode, message: String) -> Self {
+        Self { code, message, supported_versions: None }
+    }
+
+    /// Create a version unsupported error with the given message and supported versions.
+    pub(crate) fn version_unsupported(message: String, supported: Vec<u64>) -> Self {
+        Self { code: ErrorCode::VersionUnsupported, message, supported_versions: Some(supported) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    use super::*;
-
     #[test]
+    #[cfg(feature = "v1")]
     fn test_parse_json() {
+        use super::*;
+
         let known_str_error = r#"{"errorCode":"version-unsupported", "message":"custom message here", "supported": [1, 2]}"#;
         match ResponseError::parse(known_str_error) {
             ResponseError::WellKnown(e) => {
-                assert_eq!(e.code, ErrorCode::VersionUnsupported);
+                assert_eq!(e.code(), ErrorCode::VersionUnsupported);
                 assert_eq!(e.message, "custom message here");
                 assert_eq!(
                     e.to_string(),
@@ -426,12 +424,18 @@ mod tests {
             }
             _ => panic!("Expected WellKnown error"),
         };
+        let not_enough_money_error =
+            r#"{"errorCode":"not-enough-money", "message":"not enough money"}"#;
+        match ResponseError::parse(not_enough_money_error) {
+            ResponseError::WellKnown(e) => assert_eq!(e.code(), ErrorCode::NotEnoughMoney),
+            _ => panic!("Expected WellKnown error"),
+        };
         let unrecognized_error = r#"{"errorCode":"random", "message":"random"}"#;
         assert!(matches!(
             ResponseError::parse(unrecognized_error),
             ResponseError::Unrecognized { .. }
         ));
-        let invalid_json_error = json!({
+        let invalid_json_error = serde_json::json!({
             "err": "random",
             "message": "This version of payjoin is not supported."
         });

@@ -16,9 +16,12 @@ pub mod send;
 pub use request::*;
 pub(crate) mod into_url;
 pub use into_url::{Error as IntoUrlError, IntoUrl};
-pub(crate) mod uri;
-pub use uri::{PjParseError, PjUri, Uri, UriExt};
-pub use url::{ParseError, Url};
+pub(crate) mod url;
+pub use url::{ParseError as UrlParseError, Url};
+#[cfg(feature = "v2")]
+pub mod time;
+pub mod uri;
+pub use uri::{PjParam, PjParseError, PjUri, Uri, UriExt};
 pub(crate) mod error_codes;
 
 pub(crate) mod output_substitution;

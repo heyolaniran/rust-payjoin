@@ -29,38 +29,74 @@
 //! but request reuse makes correlation trivial for the relay.
 
 use bitcoin::hashes::{sha256, Hash};
-pub use error::{CreateRequestError, EncapsulationError};
-use error::{InternalCreateRequestError, InternalEncapsulationError};
+use bitcoin::Address;
+pub use error::{CreateRequestError, DecapsulationError};
+use error::{InternalCreateRequestError, InternalDecapsulationError};
 use ohttp::ClientResponse;
 use serde::{Deserialize, Serialize};
-pub use session::{replay_event_log, ReplayError, SessionEvent, SessionHistory};
-use url::Url;
+pub use session::{
+    replay_event_log, replay_event_log_async, SessionEvent, SessionHistory, SessionOutcome,
+    SessionStatus,
+};
 
 use super::error::BuildSenderError;
 use super::*;
+use crate::core::Url;
+use crate::error::{InternalReplayError, ReplayError};
 use crate::hpke::{decrypt_message_b, encrypt_message_a, HpkeSecretKey};
 use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
 use crate::persist::{
-    MaybeBadInitInputsTransition, MaybeFatalTransition, MaybeSuccessTransitionWithNoResults,
+    MaybeFatalTransition, MaybeSuccessTransitionWithNoResults, NextStateTransition,
+    TerminalTransition,
 };
-use crate::send::v1;
-use crate::send::v2::session::InternalReplayError;
-use crate::uri::{ShortId, UrlExt};
-use crate::{HpkeKeyPair, HpkePublicKey, IntoUrl, OhttpKeys, PjUri, Request};
+use crate::uri::v2::PjParam;
+use crate::uri::ShortId;
+use crate::{HpkeKeyPair, IntoUrl, PjUri, Request};
 
 mod error;
 mod session;
 
 /// A builder to construct the properties of a [`Sender`].
+/// V2 SenderBuilder differs from V1 in that it does not allow the receiver's output substitution preference to be disabled.
+/// This is because all communications with the receiver are end-to-end authenticated. So a
+/// malicious man in the middle can't substitute outputs, only the receiver can.
+/// The receiver can always choose not to substitute outputs, however.
 #[derive(Clone)]
-pub struct SenderBuilder<'a>(pub(crate) v1::SenderBuilder<'a>);
+pub struct SenderBuilder {
+    pj_param: crate::uri::v2::PjParam,
+    output_substitution: OutputSubstitution,
+    psbt_ctx_builder: PsbtContextBuilder,
+}
 
-impl<'a> SenderBuilder<'a> {
+impl SenderBuilder {
     /// Prepare the context from which to make Sender requests
     ///
     /// Call [`SenderBuilder::build_recommended()`] or other `build` methods
     /// to create a [`Sender`]
-    pub fn new(psbt: Psbt, uri: PjUri<'a>) -> Self { Self(v1::SenderBuilder::new(psbt, uri)) }
+    pub fn new(psbt: Psbt, uri: PjUri) -> Self {
+        match uri.extras.pj_param {
+            #[cfg(feature = "v1")]
+            crate::uri::PjParam::V1(_) => unimplemented!("V2 SenderBuilder only supports v2 URLs"),
+            crate::uri::PjParam::V2(pj_param) =>
+                Self::from_parts(psbt, &pj_param, &uri.address, uri.amount),
+        }
+    }
+
+    pub fn from_parts(
+        psbt: Psbt,
+        pj_param: &PjParam,
+        address: &Address,
+        amount: Option<Amount>,
+    ) -> Self {
+        Self {
+            pj_param: pj_param.clone(),
+            // Ignore the receiver's output substitution preference, because all
+            // communications with the receiver are end-to-end authenticated. So a
+            // malicious man in the middle can't substitute outputs, only the receiver can.
+            output_substitution: OutputSubstitution::Enabled,
+            psbt_ctx_builder: PsbtContextBuilder::new(psbt, address.script_pubkey(), amount),
+        }
+    }
 
     /// Disable output substitution even if the receiver didn't.
     ///
@@ -69,7 +105,7 @@ impl<'a> SenderBuilder<'a> {
     /// doing advanced operations such as opening LN channels and it also guarantees the
     /// receiver will **not** reward the sender with a discount.
     pub fn always_disable_output_substitution(self) -> Self {
-        Self(self.0.always_disable_output_substitution())
+        Self { output_substitution: OutputSubstitution::Disabled, ..self }
     }
 
     // Calculate the recommended fee contribution for an Original PSBT.
@@ -81,8 +117,10 @@ impl<'a> SenderBuilder<'a> {
     pub fn build_recommended(
         self,
         min_fee_rate: FeeRate,
-    ) -> MaybeBadInitInputsTransition<SessionEvent, Sender<WithReplyKey>, BuildSenderError> {
-        self.v2_sender_from_v1(self.0.clone().build_recommended(min_fee_rate))
+    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        let psbt_ctx =
+            self.psbt_ctx_builder.build_recommended(min_fee_rate, self.output_substitution)?;
+        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
     }
 
     /// Offer the receiver contribution to pay for his input.
@@ -104,13 +142,15 @@ impl<'a> SenderBuilder<'a> {
         change_index: Option<usize>,
         min_fee_rate: FeeRate,
         clamp_fee_contribution: bool,
-    ) -> MaybeBadInitInputsTransition<SessionEvent, Sender<WithReplyKey>, BuildSenderError> {
-        self.v2_sender_from_v1(self.0.clone().build_with_additional_fee(
+    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        let psbt_ctx = self.psbt_ctx_builder.build_with_additional_fee(
             max_fee_contribution,
             change_index,
             min_fee_rate,
             clamp_fee_contribution,
-        ))
+            self.output_substitution,
+        )?;
+        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
     }
 
     /// Perform Payjoin without incentivizing the payee to cooperate.
@@ -120,40 +160,74 @@ impl<'a> SenderBuilder<'a> {
     pub fn build_non_incentivizing(
         self,
         min_fee_rate: FeeRate,
-    ) -> MaybeBadInitInputsTransition<SessionEvent, Sender<WithReplyKey>, BuildSenderError> {
-        self.v2_sender_from_v1(self.0.clone().build_non_incentivizing(min_fee_rate))
+    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        let psbt_ctx = self
+            .psbt_ctx_builder
+            .build_non_incentivizing(min_fee_rate, self.output_substitution)?;
+        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
     }
 
     /// Helper function that takes a V1 sender build result and wraps it in a V2 Sender,
     /// returning the appropriate state transition.
-    fn v2_sender_from_v1(
-        &self,
-        v1_result: Result<v1::Sender, BuildSenderError>,
-    ) -> MaybeBadInitInputsTransition<SessionEvent, Sender<WithReplyKey>, BuildSenderError> {
-        let mut v1 = match v1_result {
-            Ok(inner) => inner,
-            Err(e) => return MaybeBadInitInputsTransition::bad_init_inputs(e),
-        };
-
-        // V2 senders may always ignore the receiver's `pjos` output substitution preference,
-        // because all communications with the receiver are end-to-end authenticated.
-        if self.0.output_substitution == OutputSubstitution::Enabled {
-            v1.output_substitution = OutputSubstitution::Enabled;
-        }
-
-        let with_reply_key = WithReplyKey { v1, reply_key: HpkeKeyPair::gen_keypair().0 };
-        MaybeBadInitInputsTransition::success(
-            SessionEvent::CreatedReplyKey(with_reply_key.clone()),
-            Sender { state: with_reply_key },
+    fn v2_transition_from_psbt_ctx(
+        pj_param: PjParam,
+        psbt_ctx: PsbtContext,
+    ) -> NextStateTransition<SessionEvent, Sender<WithReplyKey>> {
+        let sender = Sender::new(pj_param, psbt_ctx);
+        NextStateTransition::success(
+            SessionEvent::Created(Box::new(sender.session_context.clone())),
+            sender,
         )
     }
 }
 
-pub trait State {}
+mod sealed {
+    pub trait State {}
+
+    impl State for super::WithReplyKey {}
+    impl State for super::PollingForProposal {}
+}
+
+/// Sealed trait for V2 send session states.
+///
+/// This trait is sealed to prevent external implementations. Only types within this crate
+/// can implement this trait, ensuring type safety and protocol integrity.
+pub trait State: sealed::State {}
+
+impl<S: sealed::State> State for S {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sender<State> {
     pub(crate) state: State,
+    pub(crate) session_context: SessionContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContext {
+    /// The endpoint in the Payjoin URI
+    pub(crate) pj_param: PjParam,
+    /// The Original PSBT context
+    pub(crate) psbt_ctx: PsbtContext,
+    /// The secret key to decrypt the receiver's reply.
+    pub(crate) reply_key: HpkeSecretKey,
+}
+
+impl SessionContext {
+    fn full_relay_url(&self, ohttp_relay: impl IntoUrl) -> Result<Url, InternalCreateRequestError> {
+        let relay_base = ohttp_relay.into_url().map_err(InternalCreateRequestError::Url)?;
+
+        // Only reveal scheme and authority to the relay
+        let directory_base = self
+            .pj_param
+            .endpoint()
+            .join("/")
+            .map_err(|e| InternalCreateRequestError::Url(e.into()))?;
+
+        // Append that information as a path to the relay URL
+        relay_base
+            .join(&format!("/{directory_base}"))
+            .map_err(|e| InternalCreateRequestError::Url(e.into()))
+    }
 }
 
 impl<State> core::ops::Deref for Sender<State> {
@@ -166,32 +240,89 @@ impl<State> core::ops::DerefMut for Sender<State> {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.state }
 }
 
+impl<State> Sender<State> {
+    /// The endpoint in the Payjoin URI
+    pub fn endpoint(&self) -> String { self.session_context.pj_param.endpoint().to_string() }
+}
+
+impl<S: State> Sender<S> {
+    /// Cancel the Payjoin session and once the transition is persisted, return a [`PendingFallback`] state.
+    /// The fallback transaction is the sender's original transaction that
+    /// should be broadcast to complete the payment without Payjoin.
+    pub fn cancel(self) -> NextStateTransition<SessionEvent, Sender<PendingFallback>> {
+        NextStateTransition::success(
+            SessionEvent::Cancelled(),
+            Sender {
+                state: PendingFallback {
+                    fallback_tx: self
+                        .session_context
+                        .psbt_ctx
+                        .original_psbt
+                        .clone()
+                        .extract_tx_unchecked_fee_rate(),
+                },
+                session_context: self.session_context,
+            },
+        )
+    }
+}
+
 /// Represents the various states of a Payjoin send session during the protocol flow.
 ///
 /// This provides type erasure for the send session state, allowing the session to be replayed
 /// and the state to be updated with the next event over a uniform interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendSession {
-    Uninitialized,
     WithReplyKey(Sender<WithReplyKey>),
-    V2GetContext(Sender<V2GetContext>),
-    ProposalReceived(Psbt),
-    TerminalFailure,
+    PollingForProposal(Sender<PollingForProposal>),
+    PendingFallback(Sender<PendingFallback>),
+    Closed(SessionOutcome),
 }
 
 impl SendSession {
-    fn process_event(self, event: SessionEvent) -> Result<SendSession, ReplayError> {
+    fn new(session_context: SessionContext) -> Self {
+        SendSession::WithReplyKey(Sender { state: WithReplyKey, session_context })
+    }
+
+    fn process_event(
+        self,
+        event: SessionEvent,
+    ) -> Result<SendSession, ReplayError<Self, SessionEvent>> {
         match (self, event) {
-            (SendSession::Uninitialized, SessionEvent::CreatedReplyKey(sender_with_reply_key)) =>
-                Ok(SendSession::WithReplyKey(Sender { state: sender_with_reply_key })),
-            (SendSession::WithReplyKey(state), SessionEvent::V2GetContext(v2_get_context)) =>
-                Ok(state.apply_v2_get_context(v2_get_context)),
-            (SendSession::V2GetContext(_state), SessionEvent::ProposalReceived(proposal)) =>
-                Ok(SendSession::ProposalReceived(proposal)),
-            (_, SessionEvent::SessionInvalid(_)) => Ok(SendSession::TerminalFailure),
-            (current_state, event) => Err(InternalReplayError::InvalidStateAndEvent(
-                Box::new(current_state),
+            (SendSession::WithReplyKey(state), SessionEvent::PostedOriginalPsbt()) =>
+                Ok(state.apply_polling_for_proposal()),
+            (
+                SendSession::PollingForProposal(_state),
+                SessionEvent::Closed(SessionOutcome::Success(proposal)),
+            ) => Ok(SendSession::Closed(SessionOutcome::Success(proposal))),
+            (SendSession::WithReplyKey(state), SessionEvent::Cancelled()) =>
+                Ok(SendSession::PendingFallback(Sender {
+                    state: PendingFallback {
+                        fallback_tx: state
+                            .session_context
+                            .psbt_ctx
+                            .original_psbt
+                            .clone()
+                            .extract_tx_unchecked_fee_rate(),
+                    },
+                    session_context: state.session_context,
+                })),
+            (SendSession::PollingForProposal(state), SessionEvent::Cancelled()) =>
+                Ok(SendSession::PendingFallback(Sender {
+                    state: PendingFallback {
+                        fallback_tx: state
+                            .session_context
+                            .psbt_ctx
+                            .original_psbt
+                            .clone()
+                            .extract_tx_unchecked_fee_rate(),
+                    },
+                    session_context: state.session_context,
+                })),
+            (_, SessionEvent::Closed(session_outcome)) => Ok(SendSession::Closed(session_outcome)),
+            (current_state, event) => Err(InternalReplayError::InvalidEvent(
                 Box::new(event),
+                Some(Box::new(current_state)),
             )
             .into()),
         }
@@ -199,21 +330,20 @@ impl SendSession {
 }
 
 /// A payjoin V2 sender, allowing the construction of a payjoin V2 request
-/// and the resulting [`V2PostContext`].
+/// and the resulting [`ClientResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WithReplyKey {
-    /// The v1 Sender.
-    pub(crate) v1: v1::Sender,
-    /// The secret key to decrypt the receiver's reply.
-    pub(crate) reply_key: HpkeSecretKey,
-}
-
-impl State for WithReplyKey {}
+pub struct WithReplyKey;
 
 impl Sender<WithReplyKey> {
-    /// Construct serialized V1 Request and Context from a Payjoin Proposal
-    pub fn create_v1_post_request(&self) -> (Request, v1::V1Context) {
-        self.v1.create_v1_post_request()
+    fn new(pj_param: PjParam, psbt_ctx: PsbtContext) -> Self {
+        Sender {
+            state: WithReplyKey,
+            session_context: SessionContext {
+                pj_param,
+                psbt_ctx,
+                reply_key: HpkeKeyPair::gen_keypair().0,
+            },
+        }
     }
 
     /// Construct serialized Request and Context from a Payjoin Proposal.
@@ -228,48 +358,24 @@ impl Sender<WithReplyKey> {
     pub fn create_v2_post_request(
         &self,
         ohttp_relay: impl IntoUrl,
-    ) -> Result<(Request, V2PostContext), CreateRequestError> {
-        if let Ok(expiry) = self.v1.endpoint.exp() {
-            if std::time::SystemTime::now() > expiry {
-                return Err(InternalCreateRequestError::Expired(expiry).into());
-            }
+    ) -> Result<(Request, ClientResponse), CreateRequestError> {
+        if self.session_context.pj_param.expiration().elapsed() {
+            return Err(InternalCreateRequestError::Expired(
+                self.session_context.pj_param.expiration(),
+            )
+            .into());
         }
 
-        let mut ohttp_keys = self
-            .v1
-            .endpoint()
-            .ohttp()
-            .map_err(|_| InternalCreateRequestError::MissingOhttpConfig)?;
+        let mut sanitized_psbt = self.session_context.psbt_ctx.original_psbt.clone();
+        clear_unneeded_fields(&mut sanitized_psbt);
         let body = serialize_v2_body(
-            &self.v1.psbt,
-            self.v1.output_substitution,
-            self.v1.fee_contribution,
-            self.v1.min_fee_rate,
+            &sanitized_psbt,
+            self.session_context.psbt_ctx.output_substitution,
+            self.session_context.psbt_ctx.fee_contribution,
+            self.session_context.psbt_ctx.min_fee_rate,
         )?;
-        let (request, ohttp_ctx) = extract_request(
-            ohttp_relay,
-            self.reply_key.clone(),
-            body,
-            self.v1.endpoint.clone(),
-            self.extract_rs_pubkey()?,
-            &mut ohttp_keys,
-        )?;
-        let rs = self.extract_rs_pubkey()?;
-        Ok((
-            request,
-            V2PostContext {
-                endpoint: self.v1.endpoint.clone(),
-                psbt_ctx: PsbtContext {
-                    original_psbt: self.v1.psbt.clone(),
-                    output_substitution: self.v1.output_substitution,
-                    fee_contribution: self.v1.fee_contribution,
-                    payee: self.v1.payee.clone(),
-                    min_fee_rate: self.v1.min_fee_rate,
-                },
-                hpke_ctx: HpkeContext::new(rs, &self.reply_key),
-                ohttp_ctx,
-            },
-        ))
+        let (request, ohttp_ctx) = extract_request(&self.session_context, ohttp_relay, body)?;
+        Ok((request, ohttp_ctx))
     }
 
     /// Processes the response for the initial POST message from the sender
@@ -281,72 +387,61 @@ impl Sender<WithReplyKey> {
     /// returns an error with the encapsulated response status code.
     ///
     /// After this function is called, the sender can poll for a Proposal PSBT
-    /// from the receiver using the returned [`V2GetContext`].
+    /// from the receiver using the returned [`PollingForProposal`].
     pub fn process_response(
         self,
         response: &[u8],
-        post_ctx: V2PostContext,
-    ) -> MaybeFatalTransition<SessionEvent, Sender<V2GetContext>, EncapsulationError> {
-        match process_post_res(response, post_ctx.ohttp_ctx) {
+        post_ctx: ClientResponse,
+    ) -> MaybeFatalTransition<SessionEvent, Sender<PollingForProposal>, DecapsulationError> {
+        match process_post_res(response, post_ctx) {
             Ok(()) => {}
-            Err(e) => {
-                return MaybeFatalTransition::fatal(
-                    SessionEvent::SessionInvalid(e.to_string()),
-                    InternalEncapsulationError::DirectoryResponse(e).into(),
-                );
-            }
+            Err(e) =>
+                if e.is_fatal() {
+                    return MaybeFatalTransition::fatal(
+                        SessionEvent::Closed(SessionOutcome::Aborted),
+                        InternalDecapsulationError::DirectoryResponse(e).into(),
+                    );
+                } else {
+                    return MaybeFatalTransition::transient(
+                        InternalDecapsulationError::DirectoryResponse(e).into(),
+                    );
+                },
         }
 
-        let v2_get_context = V2GetContext {
-            endpoint: post_ctx.endpoint,
-            psbt_ctx: post_ctx.psbt_ctx,
-            hpke_ctx: post_ctx.hpke_ctx,
-        };
-        MaybeFatalTransition::success(
-            SessionEvent::V2GetContext(v2_get_context.clone()),
-            Sender { state: v2_get_context },
-        )
+        let sender = Sender { state: PollingForProposal, session_context: self.session_context };
+        MaybeFatalTransition::success(SessionEvent::PostedOriginalPsbt(), sender)
     }
 
-    pub(crate) fn extract_rs_pubkey(
-        &self,
-    ) -> Result<HpkePublicKey, crate::uri::url_ext::ParseReceiverPubkeyParamError> {
-        self.v1.endpoint.receiver_pubkey()
-    }
-
-    /// The endpoint in the Payjoin URI
-    pub fn endpoint(&self) -> &Url { self.v1.endpoint() }
-
-    pub(crate) fn apply_v2_get_context(self, v2_get_context: V2GetContext) -> SendSession {
-        SendSession::V2GetContext(Sender { state: v2_get_context })
+    pub(crate) fn apply_polling_for_proposal(self) -> SendSession {
+        SendSession::PollingForProposal(Sender {
+            state: PollingForProposal,
+            session_context: self.session_context,
+        })
     }
 }
 
 pub(crate) fn extract_request(
+    session_context: &SessionContext,
     ohttp_relay: impl IntoUrl,
-    reply_key: HpkeSecretKey,
     body: Vec<u8>,
-    url: Url,
-    receiver_pubkey: HpkePublicKey,
-    ohttp_keys: &mut OhttpKeys,
 ) -> Result<(Request, ClientResponse), CreateRequestError> {
-    let ohttp_relay = ohttp_relay.into_url()?;
-    let hpke_ctx = HpkeContext::new(receiver_pubkey, &reply_key);
     let body = encrypt_message_a(
         body,
-        &hpke_ctx.reply_pair.public_key().clone(),
-        &hpke_ctx.receiver.clone(),
+        HpkeKeyPair::from_secret_key(&session_context.reply_key).public_key(),
+        session_context.pj_param.receiver_pubkey(),
     )
     .map_err(InternalCreateRequestError::Hpke)?;
 
-    let (body, ohttp_ctx) = ohttp_encapsulate(ohttp_keys, "POST", url.as_str(), Some(&body))
-        .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
-    log::debug!("ohttp_relay_url: {ohttp_relay:?}");
-    let directory_base = url.join("/").map_err(|e| InternalCreateRequestError::Url(e.into()))?;
-    let full_ohttp_relay = ohttp_relay
-        .join(&format!("/{directory_base}"))
-        .map_err(|e| InternalCreateRequestError::Url(e.into()))?;
-    let request = Request::new_v2(&full_ohttp_relay, &body);
+    let (body, ohttp_ctx) = ohttp_encapsulate(
+        session_context.pj_param.ohttp_keys(),
+        "POST",
+        session_context.pj_param.endpoint().as_str(),
+        Some(&body),
+    )
+    .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
+    let full_relay_url = session_context.full_relay_url(ohttp_relay)?;
+    tracing::debug!("ohttp_relay_url: {full_relay_url:?}");
+    let request = Request::new_v2(&full_relay_url, &body);
     Ok((request, ohttp_ctx))
 }
 
@@ -359,71 +454,63 @@ pub(crate) fn serialize_v2_body(
     // Grug say localhost base be discarded anyway. no big brain needed.
     let base_url = Url::parse("http://localhost").expect("invalid URL");
 
-    let placeholder_url = serialize_url(
-        base_url,
-        output_substitution,
-        fee_contribution,
-        min_fee_rate,
-        "2", // payjoin version
-    );
+    let placeholder_url =
+        serialize_url(base_url, output_substitution, fee_contribution, min_fee_rate, Version::Two);
     let query_params = placeholder_url.query().unwrap_or_default();
     let base64 = psbt.to_string();
     Ok(format!("{base64}\n{query_params}").into_bytes())
 }
 
-/// Data required to validate the POST response.
-///
-/// This type is used to process a BIP77 POST response.
-/// Call [`Sender<V2PostContext>::process_response`] on it to continue the BIP77 flow.
-pub struct V2PostContext {
-    /// The endpoint in the Payjoin URI
-    pub(crate) endpoint: Url,
-    pub(crate) psbt_ctx: PsbtContext,
-    pub(crate) hpke_ctx: HpkeContext,
-    pub(crate) ohttp_ctx: ohttp::ClientResponse,
-}
-
 /// Data required to validate the GET response.
 ///
 /// This type is used to make a BIP77 GET request and process the response.
-/// Call [`Sender<V2GetContext>::process_response`] on it to continue the BIP77 flow.
+/// Call [`Sender<PollingForProposal>::process_response`] on it to continue the BIP77 flow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct V2GetContext {
-    /// The endpoint in the Payjoin URI
-    pub(crate) endpoint: Url,
-    pub(crate) psbt_ctx: PsbtContext,
-    pub(crate) hpke_ctx: HpkeContext,
+pub struct PollingForProposal;
+
+impl ResponseError {
+    fn from_slice(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let trimmed_bytes = bytes.split(|&byte| byte == 0).next().unwrap_or(bytes);
+        let value: serde_json::Value = serde_json::from_slice(trimmed_bytes)?;
+        Ok(ResponseError::from_json(value))
+    }
 }
 
-impl State for V2GetContext {}
-
-impl Sender<V2GetContext> {
+impl Sender<PollingForProposal> {
     /// Construct an OHTTP Encapsulated HTTP GET request for the Proposal PSBT
     pub fn create_poll_request(
         &self,
         ohttp_relay: impl IntoUrl,
     ) -> Result<(Request, ohttp::ClientResponse), CreateRequestError> {
-        let base_url = self.endpoint.clone();
+        if self.session_context.pj_param.expiration().elapsed() {
+            return Err(InternalCreateRequestError::Expired(
+                self.session_context.pj_param.expiration(),
+            )
+            .into());
+        }
 
         // TODO unify with receiver's fn short_id_from_pubkey
-        let hash = sha256::Hash::hash(&self.hpke_ctx.reply_pair.public_key().to_compressed_bytes());
+        let hash = sha256::Hash::hash(
+            &HpkeKeyPair::from_secret_key(&self.session_context.reply_key)
+                .public_key()
+                .to_compressed_bytes(),
+        );
         let mailbox: ShortId = hash.into();
-        let url = base_url
+        let url = Url::parse(self.session_context.pj_param.endpoint().as_str())
+            .expect("Could not parse url")
             .join(&mailbox.to_string())
             .map_err(|e| InternalCreateRequestError::Url(e.into()))?;
         let body = encrypt_message_a(
             Vec::new(),
-            &self.hpke_ctx.reply_pair.public_key().clone(),
-            &self.hpke_ctx.receiver.clone(),
+            HpkeKeyPair::from_secret_key(&self.session_context.reply_key).public_key(),
+            self.session_context.pj_param.receiver_pubkey(),
         )
         .map_err(InternalCreateRequestError::Hpke)?;
-        let mut ohttp =
-            self.endpoint.ohttp().map_err(|_| InternalCreateRequestError::MissingOhttpConfig)?;
-        let (body, ohttp_ctx) = ohttp_encapsulate(&mut ohttp, "GET", url.as_str(), Some(&body))
+        let ohttp_keys = self.session_context.pj_param.ohttp_keys();
+        let (body, ohttp_ctx) = ohttp_encapsulate(ohttp_keys, "GET", url.as_str(), Some(&body))
             .map_err(InternalCreateRequestError::OhttpEncapsulation)?;
 
-        let url = ohttp_relay.into_url().map_err(InternalCreateRequestError::Url)?;
-        Ok((Request::new_v2(&url, &body), ohttp_ctx))
+        Ok((Request::new_v2(&self.session_context.full_relay_url(ohttp_relay)?, &body), ohttp_ctx))
     }
 
     /// Processes the response for the final GET message from the sender client
@@ -437,73 +524,95 @@ impl Sender<V2GetContext> {
     /// After this function is called, the sender can sign and finalize the
     /// PSBT and broadcast the resulting Payjoin transaction to the network.
     pub fn process_response(
-        &self,
+        self,
         response: &[u8],
         ohttp_ctx: ohttp::ClientResponse,
-    ) -> MaybeSuccessTransitionWithNoResults<SessionEvent, Psbt, Sender<V2GetContext>, ResponseError>
-    {
+    ) -> MaybeSuccessTransitionWithNoResults<
+        SessionEvent,
+        Psbt,
+        Sender<PollingForProposal>,
+        ResponseError,
+    > {
         let body = match process_get_res(response, ohttp_ctx) {
             Ok(Some(body)) => body,
             Ok(None) => return MaybeSuccessTransitionWithNoResults::no_results(self.clone()),
             Err(e) =>
-                return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::SessionInvalid(e.to_string()),
-                    InternalEncapsulationError::DirectoryResponse(e).into(),
-                ),
+                if e.is_fatal() {
+                    return MaybeSuccessTransitionWithNoResults::fatal(
+                        SessionEvent::Closed(SessionOutcome::Aborted),
+                        InternalDecapsulationError::DirectoryResponse(e).into(),
+                    );
+                } else {
+                    return MaybeSuccessTransitionWithNoResults::transient(
+                        InternalDecapsulationError::DirectoryResponse(e).into(),
+                    );
+                },
         };
-        let psbt = match decrypt_message_b(
+
+        let body = match decrypt_message_b(
             &body,
-            self.hpke_ctx.receiver.clone(),
-            self.hpke_ctx.reply_pair.secret_key().clone(),
+            self.session_context.pj_param.receiver_pubkey().clone(),
+            &self.session_context.reply_key,
         ) {
-            Ok(psbt) => psbt,
+            Ok(body) => body,
             Err(e) =>
                 return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::SessionInvalid(e.to_string()),
-                    InternalEncapsulationError::Hpke(e).into(),
+                    SessionEvent::Closed(SessionOutcome::Aborted),
+                    InternalDecapsulationError::Hpke(e).into(),
                 ),
         };
-        let proposal = match Psbt::deserialize(&psbt) {
+
+        if let Ok(resp_err) = ResponseError::from_slice(&body) {
+            return MaybeSuccessTransitionWithNoResults::fatal(
+                SessionEvent::Closed(SessionOutcome::Aborted),
+                resp_err,
+            );
+        }
+
+        let proposal = match Psbt::deserialize(&body) {
             Ok(proposal) => proposal,
             Err(e) =>
                 return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::SessionInvalid(e.to_string()),
+                    SessionEvent::Closed(SessionOutcome::Aborted),
                     InternalProposalError::Psbt(e).into(),
                 ),
         };
-        let processed_proposal = match self.psbt_ctx.clone().process_proposal(proposal) {
-            Ok(processed_proposal) => processed_proposal,
-            Err(e) =>
-                return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::SessionInvalid(e.to_string()),
-                    e.into(),
-                ),
-        };
+        let processed_proposal =
+            match self.session_context.psbt_ctx.clone().process_proposal(proposal) {
+                Ok(processed_proposal) => processed_proposal,
+                Err(e) =>
+                    return MaybeSuccessTransitionWithNoResults::fatal(
+                        SessionEvent::Closed(SessionOutcome::Aborted),
+                        e.into(),
+                    ),
+            };
 
         MaybeSuccessTransitionWithNoResults::success(
             processed_proposal.clone(),
-            SessionEvent::ProposalReceived(processed_proposal),
+            SessionEvent::Closed(SessionOutcome::Success(processed_proposal)),
         )
     }
-    pub fn endpoint(&self) -> &Url { &self.endpoint }
 }
 
-#[cfg(feature = "v2")]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct HpkeContext {
-    pub(crate) receiver: HpkePublicKey,
-    pub(crate) reply_pair: HpkeKeyPair,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFallback {
+    fallback_tx: bitcoin::Transaction,
 }
 
-#[cfg(feature = "v2")]
-impl HpkeContext {
-    pub fn new(receiver: HpkePublicKey, reply_key: &HpkeSecretKey) -> Self {
-        Self { receiver, reply_pair: HpkeKeyPair::from_secret_key(reply_key) }
+impl Sender<PendingFallback> {
+    /// Returns the fallback transaction that should be broadcast to complete the payment without Payjoin.
+    pub fn fallback_tx(&self) -> &bitcoin::Transaction { &self.fallback_tx }
+
+    /// Mark the session as complete, signaling that the fallback transaction
+    /// has been broadcast or its control has been transferred.
+    pub fn close(&self) -> TerminalTransition<SessionEvent, ()> {
+        TerminalTransition::new(SessionEvent::Closed(SessionOutcome::Aborted), ())
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
     use std::time::{Duration, SystemTime};
 
     use bitcoin::hex::FromHex;
@@ -511,19 +620,32 @@ mod test {
     use payjoin_test_utils::{BoxError, EXAMPLE_URL, KEM, KEY_ID, PARSED_ORIGINAL_PSBT, SYMMETRIC};
 
     use super::*;
-    use crate::persist::NoopSessionPersister;
-    use crate::receive::v2::Receiver;
+    use crate::persist::InMemoryPersister;
+    use crate::receive::v2::ReceiverBuilder;
+    use crate::time::Time;
     use crate::OhttpKeys;
 
     const SERIALIZED_BODY_V2: &str = "63484e696450384241484d43414141414159386e757447674a647959475857694245623435486f65396c5747626b78682f36624e694f4a6443447544414141414141442b2f2f2f2f41747956754155414141414146366b554865684a38476e536442554f4f7636756a584c72576d734a5244434867495165414141414141415871525233514a62627a30686e513849765130667074476e2b766f746e656f66544141414141414542494b6762317755414141414146366b55336b34656b47484b57524e6241317256357452356b455644564e4348415163584667415578347046636c4e56676f31575741644e3153594e583874706854414243477343527a424541694238512b41366465702b527a393276687932366c5430416a5a6e3450524c6938426639716f422f434d6b30774967502f526a3250575a3367456a556b546c6844524e415130675877544f3774396e2b563134705a366f6c6a554249514d566d7341616f4e5748564d5330324c6654536530653338384c4e697450613155515a794f6968592b464667414241425941464562324769753663344b4f35595730706677336c4770396a4d55554141413d0a763d32";
 
-    fn create_sender_context() -> Result<super::Sender<super::WithReplyKey>, BoxError> {
+    fn create_sender_context(
+        expiration: Time,
+    ) -> Result<super::Sender<super::WithReplyKey>, BoxError> {
         let endpoint = Url::parse("http://localhost:1234")?;
-        let mut sender = super::Sender {
-            state: super::WithReplyKey {
-                v1: v1::Sender {
-                    psbt: PARSED_ORIGINAL_PSBT.clone(),
-                    endpoint,
+        let pj_param = crate::uri::v2::PjParam::new(
+            endpoint,
+            crate::uri::ShortId::try_from(&b"12345670"[..]).expect("valid short id"),
+            expiration,
+            OhttpKeys(
+                ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).expect("valid key config"),
+            ),
+            HpkeKeyPair::gen_keypair().1,
+        );
+        Ok(super::Sender {
+            state: super::WithReplyKey,
+            session_context: SessionContext {
+                pj_param,
+                psbt_ctx: PsbtContext {
+                    original_psbt: PARSED_ORIGINAL_PSBT.clone(),
                     output_substitution: OutputSubstitution::Enabled,
                     fee_contribution: None,
                     min_fee_rate: FeeRate::ZERO,
@@ -531,24 +653,19 @@ mod test {
                 },
                 reply_key: HpkeKeyPair::gen_keypair().0,
             },
-        };
-        sender.v1.endpoint.set_exp(SystemTime::now() + Duration::from_secs(60));
-        sender.v1.endpoint.set_receiver_pubkey(HpkeKeyPair::gen_keypair().1);
-        sender.v1.endpoint.set_ohttp(OhttpKeys(
-            ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).expect("valid key config"),
-        ));
-
-        Ok(sender)
+        })
     }
 
     #[test]
     fn test_serialize_v2() -> Result<(), BoxError> {
-        let sender = create_sender_context()?;
+        let expiration =
+            Time::from_now(Duration::from_secs(60)).expect("expiration should be valid");
+        let sender = create_sender_context(expiration)?;
         let body = serialize_v2_body(
-            &sender.v1.psbt,
-            sender.v1.output_substitution,
-            sender.v1.fee_contribution,
-            sender.v1.min_fee_rate,
+            &sender.session_context.psbt_ctx.original_psbt,
+            sender.session_context.psbt_ctx.output_substitution,
+            sender.session_context.psbt_ctx.fee_contribution,
+            sender.session_context.psbt_ctx.min_fee_rate,
         );
         assert_eq!(body.as_ref().unwrap(), &<Vec<u8> as FromHex>::from_hex(SERIALIZED_BODY_V2)?,);
         Ok(())
@@ -556,76 +673,51 @@ mod test {
 
     #[test]
     fn test_extract_v2_success() -> Result<(), BoxError> {
-        let sender = create_sender_context()?;
-        let ohttp_relay = EXAMPLE_URL.clone();
+        let expiration =
+            Time::from_now(Duration::from_secs(60)).expect("expiration should be valid");
+        let sender = create_sender_context(expiration)?;
+        let ohttp_relay = EXAMPLE_URL;
         let result = sender.create_v2_post_request(ohttp_relay);
-        let (request, context) = result.expect("Result should be ok");
+        let (request, _) = result.expect("Result should be ok");
         assert!(!request.body.is_empty(), "Request body should not be empty");
         assert_eq!(
             request.url.to_string(),
-            format!("{}{}", EXAMPLE_URL.clone(), sender.v1.endpoint.join("/")?)
+            format!("{}/{}", EXAMPLE_URL, sender.session_context.pj_param.endpoint().join("/")?)
         );
-        assert_eq!(context.endpoint, sender.v1.endpoint);
-        assert_eq!(context.psbt_ctx.original_psbt, sender.v1.psbt);
-        Ok(())
-    }
-
-    #[test]
-    fn test_extract_v2_fails_missing_pubkey() -> Result<(), BoxError> {
-        let expected_error = "cannot parse receiver public key: receiver public key is missing";
-        let mut sender = create_sender_context()?;
-        sender.v1.endpoint.set_fragment(Some(""));
-        sender.v1.endpoint.set_exp(SystemTime::now() + Duration::from_secs(60));
-        sender.v1.endpoint.set_ohttp(OhttpKeys(
-            ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).expect("valid key config"),
-        ));
-        let ohttp_relay = EXAMPLE_URL.clone();
-        let result = sender.create_v2_post_request(ohttp_relay);
-        assert!(result.is_err(), "Extract v2 expected receiver pubkey error, but it succeeded");
-
-        match result {
-            Ok(_) => panic!("Expected error, got success"),
-            Err(error) => assert_eq!(format!("{error}"), expected_error),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_extract_v2_fails_missing_ohttp_config() -> Result<(), BoxError> {
-        let expected_error = "no ohttp configuration with which to make a v2 request available";
-        let mut sender = create_sender_context()?;
-        sender.v1.endpoint.set_fragment(Some(""));
-        sender.v1.endpoint.set_exp(SystemTime::now() + Duration::from_secs(60));
-        sender.v1.endpoint.set_receiver_pubkey(HpkeKeyPair::gen_keypair().1);
-        let ohttp_relay = EXAMPLE_URL.clone();
-        let result = sender.create_v2_post_request(ohttp_relay);
-        assert!(result.is_err(), "Extract v2 expected missing ohttp error, but it succeeded");
-
-        match result {
-            Ok(_) => panic!("Expected error, got success"),
-            Err(error) => assert_eq!(format!("{error}"), expected_error),
-        }
         Ok(())
     }
 
     #[test]
     fn test_extract_v2_fails_when_expired() -> Result<(), BoxError> {
-        let expected_error = "session expired at SystemTime";
-        let mut sender = create_sender_context()?;
-        let exp_time = std::time::SystemTime::now();
-        sender.v1.endpoint.set_exp(exp_time);
-        let ohttp_relay = EXAMPLE_URL.clone();
+        // Create a sender with an already expired timestamp
+        let expiration = Time::try_from(SystemTime::now() - Duration::from_secs(1))
+            .expect("time in the past should be representable");
+
+        let sender = create_sender_context(expiration)?;
+        let ohttp_relay = EXAMPLE_URL;
         let result = sender.create_v2_post_request(ohttp_relay);
-        assert!(result.is_err(), "Extract v2 expected expiry error, but it succeeded");
+        assert!(result.is_err(), "Extract v2 expected expiration error, but it succeeded");
 
         match result {
             Ok(_) => panic!("Expected error, got success"),
-            Err(error) => assert_eq!(
-                format!("{error}")
-                    .split_once(" {")
-                    .map_or(format!("{error}"), |(prefix, _)| prefix.to_string()),
-                expected_error
-            ),
+            Err(error) => assert_eq!(format!("{error}"), "session expired",),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_poll_request_fails_when_expired() -> Result<(), BoxError> {
+        let expiration = Time::try_from(SystemTime::now() - Duration::from_secs(1))
+            .expect("time in the past should be representable");
+        let sender = create_sender_context(expiration)?;
+        let sender =
+            Sender { state: PollingForProposal, session_context: sender.session_context.clone() };
+
+        let result = sender.create_poll_request(EXAMPLE_URL);
+
+        match result {
+            Ok(_) => panic!("Expected session expiration error, got success"),
+            Err(error) => assert!(error.is_expired()),
         }
         Ok(())
     }
@@ -635,43 +727,94 @@ mod test {
         let address = Address::from_str("2N47mmrWXsNBvQR6k78hWJoTji57zXwNcU7")
             .expect("valid address")
             .assume_checked();
-        let directory = EXAMPLE_URL.clone();
+        let directory = EXAMPLE_URL;
         let ohttp_keys = OhttpKeys(
             ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).expect("valid key config"),
         );
-        let pj_uri = Receiver::create_session(address.clone(), directory, ohttp_keys, None)
-            .save(&NoopSessionPersister::default())
+        let pj_uri = ReceiverBuilder::new(address.clone(), directory, ohttp_keys)
+            .expect("constructor on test vector should not fail")
+            .build()
+            .save(&InMemoryPersister::default())
             .expect("receiver should succeed")
             .pj_uri();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
             .build_recommended(FeeRate::BROADCAST_MIN)
-            .save(&NoopSessionPersister::default())
+            .expect("build on test vector should succeed")
+            .save(&InMemoryPersister::default())
             .expect("sender should succeed");
         // v2 senders may always override the receiver's `pjos` parameter to enable output
         // substitution
-        assert_eq!(req_ctx.v1.output_substitution, OutputSubstitution::Enabled);
-        assert_eq!(&req_ctx.v1.payee, &address.script_pubkey());
-        let fee_contribution = req_ctx.v1.fee_contribution.expect("sender should contribute fees");
+        assert_eq!(
+            req_ctx.session_context.psbt_ctx.output_substitution,
+            OutputSubstitution::Enabled
+        );
+        assert_eq!(&req_ctx.session_context.psbt_ctx.payee, &address.script_pubkey());
+        let fee_contribution = req_ctx
+            .session_context
+            .psbt_ctx
+            .fee_contribution
+            .expect("sender should contribute fees");
         assert_eq!(fee_contribution.max_amount, Amount::from_sat(91));
         assert_eq!(fee_contribution.vout, 0);
-        assert_eq!(req_ctx.v1.min_fee_rate, FeeRate::from_sat_per_kwu(250));
+        assert_eq!(req_ctx.session_context.psbt_ctx.min_fee_rate, FeeRate::from_sat_per_kwu(250));
         // ensure that the other builder methods also enable output substitution
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
             .build_non_incentivizing(FeeRate::BROADCAST_MIN)
-            .save(&NoopSessionPersister::default())
+            .expect("build on test vector should succeed")
+            .save(&InMemoryPersister::default())
             .expect("sender should succeed");
-        assert_eq!(req_ctx.v1.output_substitution, OutputSubstitution::Enabled);
+        assert_eq!(
+            req_ctx.session_context.psbt_ctx.output_substitution,
+            OutputSubstitution::Enabled
+        );
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
             .build_with_additional_fee(Amount::ZERO, Some(0), FeeRate::BROADCAST_MIN, false)
-            .save(&NoopSessionPersister::default())
+            .expect("build on test vector should succeed")
+            .save(&InMemoryPersister::default())
             .expect("sender should succeed");
-        assert_eq!(req_ctx.v1.output_substitution, OutputSubstitution::Enabled);
+        assert_eq!(
+            req_ctx.session_context.psbt_ctx.output_substitution,
+            OutputSubstitution::Enabled
+        );
         // ensure that a v2 sender may still disable output substitution if they prefer.
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri)
             .always_disable_output_substitution()
             .build_recommended(FeeRate::BROADCAST_MIN)
-            .save(&NoopSessionPersister::default())
+            .expect("build on test vector should succeed")
+            .save(&InMemoryPersister::default())
             .expect("sender should succeed");
-        assert_eq!(req_ctx.v1.output_substitution, OutputSubstitution::Disabled);
+        assert_eq!(
+            req_ctx.session_context.psbt_ctx.output_substitution,
+            OutputSubstitution::Disabled
+        );
+    }
+
+    #[test]
+    fn cancel_returns_expected_fallback() -> Result<(), BoxError> {
+        let expiration =
+            Time::from_now(Duration::from_secs(60)).expect("expiration should be valid");
+        let sender = create_sender_context(expiration)?;
+        let expected_tx = PARSED_ORIGINAL_PSBT.clone().extract_tx_unchecked_fee_rate();
+
+        macro_rules! do_cancel_test {
+            ($state:expr) => {{
+                let persister = InMemoryPersister::<SessionEvent>::default();
+                let fallback =
+                    Sender { state: $state, session_context: sender.session_context.clone() }
+                        .cancel()
+                        .save(&persister)
+                        .expect("save should succeed");
+                assert_eq!(
+                    *fallback.fallback_tx(),
+                    expected_tx,
+                    "cancel from {}",
+                    stringify!($state)
+                );
+            }};
+        }
+
+        do_cancel_test!(WithReplyKey);
+        do_cancel_test!(PollingForProposal);
+        Ok(())
     }
 }

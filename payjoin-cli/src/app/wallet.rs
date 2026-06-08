@@ -1,39 +1,36 @@
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use bitcoincore_rpc::json::WalletCreateFundedPsbtOptions;
-use bitcoincore_rpc::{Auth, Client, RpcApi};
-use payjoin::bitcoin::consensus::encode::{deserialize, serialize_hex};
-use payjoin::bitcoin::consensus::Encodable;
+use bitcoind_async_client::corepc_types::model::ListUnspentItem;
+use bitcoind_async_client::traits::{Broadcaster, Reader, Signer, Wallet};
+use bitcoind_async_client::types::{CreateRawTransactionOutput, WalletCreateFundedPsbtOptions};
+use bitcoind_async_client::{Auth, Client as AsyncBitcoinRpc};
 use payjoin::bitcoin::psbt::{Input, Psbt};
 use payjoin::bitcoin::{
-    Address, Amount, Denomination, FeeRate, Network, OutPoint, Script, Transaction, TxIn, TxOut,
-    Txid,
+    Address, Amount, FeeRate, Network, OutPoint, Script, Transaction, TxIn, TxOut, Txid,
 };
 use payjoin::receive::InputPair;
 
-/// Implementation of PayjoinWallet for bitcoind
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BitcoindWallet {
-    pub bitcoind: std::sync::Arc<Client>,
+    rpc: Arc<AsyncBitcoinRpc>,
 }
 
 impl BitcoindWallet {
-    pub fn new(config: &crate::app::config::BitcoindConfig) -> Result<Self> {
-        let client = match &config.cookie {
+    pub async fn new(config: &crate::app::config::BitcoindConfig) -> Result<Self> {
+        let auth = match &config.cookie {
             Some(cookie) if cookie.as_os_str().is_empty() =>
                 return Err(anyhow!(
                     "Cookie authentication enabled but no cookie path provided in config.toml"
                 )),
-            Some(cookie) => Client::new(config.rpchost.as_str(), Auth::CookieFile(cookie.into())),
-            None => Client::new(
-                config.rpchost.as_str(),
-                Auth::UserPass(config.rpcuser.clone(), config.rpcpassword.clone()),
-            ),
-        }?;
-        Ok(Self { bitcoind: Arc::new(client) })
+            Some(cookie) => Auth::CookieFile(cookie.into()),
+            None => Auth::UserPass(config.rpcuser.clone(), config.rpcpassword.clone()),
+        };
+
+        let rpc = AsyncBitcoinRpc::new(config.rpchost.to_string(), auth, None, None, None)?;
+
+        Ok(Self { rpc: Arc::new(rpc) })
     }
 }
 
@@ -45,36 +42,51 @@ impl BitcoindWallet {
         fee_rate: FeeRate,
         lock_unspent: bool,
     ) -> Result<Psbt> {
-        let fee_sat_per_kvb =
-            fee_rate.to_sat_per_kwu().checked_mul(4).ok_or_else(|| anyhow!("Invalid fee rate"))?;
-        let fee_per_kvb = Amount::from_sat(fee_sat_per_kvb);
-        log::debug!("Fee rate sat/kvb: {}", fee_per_kvb.display_in(Denomination::Satoshi));
+        tracing::debug!("Fee rate sat/vb: {}", fee_rate);
 
         let options = WalletCreateFundedPsbtOptions {
-            lock_unspent: Some(lock_unspent),
-            fee_rate: Some(fee_per_kvb),
-            ..Default::default()
+            fee_rate: Some(fee_rate),
+            lock_unspents: Some(lock_unspent),
+            replaceable: None,
+            conf_target: None,
         };
 
-        let psbt = self
-            .bitcoind
-            .wallet_create_funded_psbt(
-                &[], // inputs
-                &outputs,
-                None, // locktime
-                Some(options),
-                None,
-            )
-            .context("Failed to create PSBT")?
-            .psbt;
+        // Set locktime to current block height for anti-fee-sniping
+        // This is to follow wallet fingerprinting best practices and set and opinionated
+        // default for external wallet integrations to follow along with
+        let locktime = Some(tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { self.rpc.get_block_count().await })
+        })? as u32);
 
-        let psbt = self
-            .bitcoind
-            .wallet_process_psbt(&psbt, None, None, None)
-            .context("Failed to process PSBT")?
-            .psbt;
+        // Sync wrapper around async call - use tokio handle to avoid deadlock
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.rpc
+                    .wallet_create_funded_psbt(
+                        &[], // inputs
+                        &outputs
+                            .iter()
+                            .map(|(k, v)| CreateRawTransactionOutput::AddressAmount {
+                                address: k.clone(),
+                                amount: v.to_btc(),
+                            })
+                            .collect::<Vec<_>>(),
+                        locktime,
+                        Some(options),
+                        None,
+                    )
+                    .await
+            })
+        })?;
 
-        Psbt::from_str(&psbt).context("Failed to load PSBT from base64")
+        let processed = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.rpc.wallet_process_psbt(&result.psbt.to_string(), None, None, None).await
+            })
+        })?
+        .psbt;
+
+        Ok(processed)
     }
 
     /// Process a PSBT, validating and signing inputs owned by this wallet
@@ -82,93 +94,115 @@ impl BitcoindWallet {
     /// Does not include bip32 derivations in the PSBT
     pub fn process_psbt(&self, psbt: &Psbt) -> Result<Psbt> {
         let psbt_str = psbt.to_string();
-        let processed = self
-            .bitcoind
-            .wallet_process_psbt(&psbt_str, None, None, Some(false))
-            .context("Failed to process PSBT")?
-            .psbt;
-        Psbt::from_str(&processed).context("Failed to parse processed PSBT")
-    }
-
-    /// Finalize a PSBT and extract the transaction
-    pub fn finalize_psbt(&self, psbt: &Psbt) -> Result<Transaction> {
-        let result = self
-            .bitcoind
-            .finalize_psbt(&psbt.to_string(), Some(true))
-            .context("Failed to finalize PSBT")?;
-        let tx = deserialize(&result.hex.ok_or_else(|| anyhow!("Incomplete PSBT"))?)?;
-        Ok(tx)
+        let processed = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.rpc.wallet_process_psbt(&psbt_str, Some(true), None, None).await
+            })
+        })?;
+        Ok(processed.psbt)
     }
 
     pub fn can_broadcast(&self, tx: &Transaction) -> Result<bool> {
-        let raw_tx = serialize_hex(&tx);
-        let mempool_results = self.bitcoind.test_mempool_accept(&[raw_tx])?;
-        match mempool_results.first() {
-            Some(result) => Ok(result.allowed),
-            None => Err(anyhow!("No mempool results returned on broadcast check",)),
-        }
+        let mempool_results = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { self.rpc.test_mempool_accept(tx).await })
+        })?;
+
+        mempool_results
+            .results
+            .first()
+            .map(|result| result.reject_reason.is_none())
+            .ok_or_else(|| anyhow!("No mempool results returned on broadcast check"))
     }
 
     /// Broadcast a raw transaction
     pub fn broadcast_tx(&self, tx: &Transaction) -> Result<Txid> {
-        let mut serialized_tx = Vec::new();
-        tx.consensus_encode(&mut serialized_tx)?;
-        self.bitcoind
-            .send_raw_transaction(&serialized_tx)
-            .context("Failed to broadcast transaction")
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { self.rpc.send_raw_transaction(tx).await })
+        })
+        .context("Failed to broadcast transaction")
     }
 
     /// Check if a script belongs to this wallet
     pub fn is_mine(&self, script: &Script) -> Result<bool> {
         if let Ok(address) = Address::from_script(script, self.network()?) {
-            self.bitcoind
-                .get_address_info(&address)
-                .map(|info| info.is_mine.unwrap_or(false))
-                .context("Failed to get address info")
+            let info = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { self.rpc.get_address_info(&address).await })
+            })
+            .context("Failed to get address info")?;
+            Ok(info.is_mine)
         } else {
             Ok(false)
         }
     }
 
+    #[cfg(feature = "v2")]
+    pub fn get_raw_transaction(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<payjoin::bitcoin::Transaction>> {
+        let raw_tx = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match self.rpc.get_transaction(txid).await {
+                    Ok(rpc_res) => Ok(Some(rpc_res.tx)),
+                    Err(e) =>
+                        if e.is_tx_not_found() {
+                            Ok(None)
+                        } else {
+                            Err(e)
+                        },
+                }
+            })
+        })?;
+        Ok(raw_tx)
+    }
+
     /// Get a new address from the wallet
     pub fn get_new_address(&self) -> Result<Address> {
-        self.bitcoind
-            .get_new_address(None, None)
-            .context("Failed to get new address")?
-            .require_network(self.network()?)
-            .context("Invalid network for address")
+        let addr = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { self.rpc.get_new_address().await })
+        })
+        .context("Failed to get new address")?;
+        Ok(addr)
     }
 
     /// List unspent UTXOs
     pub fn list_unspent(&self) -> Result<Vec<InputPair>> {
-        let unspent = self
-            .bitcoind
-            .list_unspent(None, None, None, None, None)
-            .context("Failed to list unspent")?;
-        Ok(unspent.into_iter().map(input_pair_from_list_unspent).collect())
+        let unspent = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { self.rpc.list_unspent(None, None, None, None, None).await })
+        })
+        .context("Failed to list unspent")?;
+        Ok(unspent.0.into_iter().map(input_pair_from_corepc).collect())
+    }
+
+    /// Check if wallet has any spendable UTXOs
+    pub fn has_spendable_utxos(&self) -> Result<bool> {
+        let unspent = self.list_unspent()?;
+        Ok(!unspent.is_empty())
     }
 
     /// Get the network this wallet is operating on
     pub fn network(&self) -> Result<Network> {
-        self.bitcoind
-            .get_blockchain_info()
-            .map_err(|_| anyhow!("Failed to get blockchain info"))
-            .map(|info| info.chain)
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { self.rpc.network().await })
+        })
+        .map_err(|e| anyhow!("Failed to get blockchain info: {e}"))
     }
 }
 
-pub fn input_pair_from_list_unspent(
-    utxo: bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry,
-) -> InputPair {
+pub fn input_pair_from_corepc(utxo: ListUnspentItem) -> InputPair {
     let psbtin = Input {
         // NOTE: non_witness_utxo is not necessary because bitcoin-cli always supplies
         // witness_utxo, even for non-witness inputs
         witness_utxo: Some(TxOut {
-            value: utxo.amount,
-            script_pubkey: utxo.script_pub_key.clone(),
+            value: Amount::from_btc(utxo.amount.to_btc()).expect("Valid amount"),
+            script_pubkey: utxo.script_pubkey,
         }),
-        redeem_script: utxo.redeem_script.clone(),
-        witness_script: utxo.witness_script.clone(),
+        redeem_script: None,
+        witness_script: None, // Not available in this version
         ..Default::default()
     };
     let txin = TxIn {

@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::fmt;
 
 use bitcoin::FeeRate;
-use log::warn;
+use tracing::warn;
 
 use crate::output_substitution::OutputSubstitution;
 use crate::Version;
@@ -17,9 +17,6 @@ pub(crate) struct Params {
     pub additional_fee_contribution: Option<(bitcoin::Amount, usize)>,
     // minfeerate
     pub min_fee_rate: FeeRate,
-    #[cfg(feature = "_multiparty")]
-    /// Opt in to optimistic psbt merge
-    pub optimistic_merge: bool,
 }
 
 impl Default for Params {
@@ -29,8 +26,6 @@ impl Default for Params {
             output_substitution: OutputSubstitution::Enabled,
             additional_fee_contribution: None,
             min_fee_rate: FeeRate::BROADCAST_MIN,
-            #[cfg(feature = "_multiparty")]
-            optimistic_merge: false,
         }
     }
 }
@@ -114,8 +109,6 @@ impl Params {
                     } else {
                         OutputSubstitution::Enabled
                     },
-                #[cfg(feature = "_multiparty")]
-                ("optimisticmerge", v) => params.optimistic_merge = v == "true",
                 _ => (),
             }
         }
@@ -125,8 +118,17 @@ impl Params {
             additional_fee_output_index,
         );
 
-        log::debug!("parsed optional parameters: {params:?}");
+        tracing::trace!("parsed optional parameters: {params:?}");
         Ok(params)
+    }
+
+    pub fn from_query_str(
+        query: &str,
+        supported_versions: &'static [Version],
+    ) -> Result<Self, Error> {
+        let url = crate::Url::parse(&format!("http://localhost/?{query}"))
+            .map_err(|_| Error::MalformedQuery)?;
+        Self::from_query_pairs(url.query_pairs().into_iter(), supported_versions)
     }
 }
 
@@ -134,6 +136,7 @@ impl Params {
 pub(crate) enum Error {
     UnknownVersion { supported_versions: &'static [Version] },
     FeeRate,
+    MalformedQuery,
 }
 
 impl fmt::Display for Error {
@@ -141,6 +144,7 @@ impl fmt::Display for Error {
         match self {
             Error::UnknownVersion { .. } => write!(f, "unknown version"),
             Error::FeeRate => write!(f, "could not parse feerate"),
+            Error::MalformedQuery => write!(f, "malformed query parameter encoding"),
         }
     }
 }
@@ -159,9 +163,8 @@ pub(crate) mod test {
 
     #[test]
     fn test_parse_params() {
-        let pairs = url::form_urlencoded::parse(b"&maxadditionalfeecontribution=182&additionalfeeoutputindex=0&minfeerate=2&disableoutputsubstitution=true&optimisticmerge=true");
-        let params = Params::from_query_pairs(pairs, &[Version::One])
-            .expect("Could not parse params from query pairs");
+        let params = Params::from_query_str("&maxadditionalfeecontribution=182&additionalfeeoutputindex=0&minfeerate=2&disableoutputsubstitution=true&optimisticmerge=true", &[Version::One])
+            .expect("Could not parse params from query str");
         assert_eq!(params.v, Version::One);
         assert_eq!(params.output_substitution, OutputSubstitution::Disabled);
         assert_eq!(params.additional_fee_contribution, Some((Amount::from_sat(182), 0)));
@@ -169,8 +172,6 @@ pub(crate) mod test {
             params.min_fee_rate,
             FeeRate::from_sat_per_vb(2).expect("Could not calculate feerate")
         );
-        #[cfg(feature = "_multiparty")]
-        assert!(params.optimistic_merge)
     }
 
     #[test]

@@ -13,23 +13,24 @@ const OHTTP_REQ_HEADER_BYTES: usize = 7;
 pub const PADDED_BHTTP_REQ_BYTES: usize =
     ENCAPSULATED_MESSAGE_BYTES - (N_ENC + N_T + OHTTP_REQ_HEADER_BYTES);
 
-pub fn ohttp_encapsulate(
-    ohttp_keys: &mut ohttp::KeyConfig,
+pub(crate) fn ohttp_encapsulate(
+    ohttp_keys: &ohttp::KeyConfig,
     method: &str,
     target_resource: &str,
     body: Option<&[u8]>,
 ) -> Result<([u8; ENCAPSULATED_MESSAGE_BYTES], ohttp::ClientResponse), OhttpEncapsulationError> {
     use std::fmt::Write;
+    let mut ohttp_keys = ohttp_keys.clone();
 
-    let ctx = ohttp::ClientRequest::from_config(ohttp_keys)?;
-    let url = url::Url::parse(target_resource)?;
-    let authority_bytes = url.host().map_or_else(Vec::new, |host| {
-        let mut authority = host.to_string();
+    let ctx = ohttp::ClientRequest::from_config(&mut ohttp_keys)?;
+    let url = crate::core::Url::parse(target_resource)?;
+    let authority_bytes = {
+        let mut authority = url.host_str();
         if let Some(port) = url.port() {
             write!(authority, ":{port}").unwrap();
         }
         authority.into_bytes()
-    });
+    };
     let mut bhttp_message = bhttp::Message::request(
         method.as_bytes().to_vec(),
         url.scheme().as_bytes().to_vec(),
@@ -57,6 +58,18 @@ pub enum DirectoryResponseError {
     InvalidSize(usize),
     OhttpDecapsulation(OhttpEncapsulationError),
     UnexpectedStatusCode(http::StatusCode),
+}
+
+impl DirectoryResponseError {
+    pub(crate) fn is_fatal(&self) -> bool {
+        use DirectoryResponseError::*;
+
+        match self {
+            OhttpDecapsulation(_) => true,
+            InvalidSize(_) => false,
+            UnexpectedStatusCode(status_code) => status_code.is_client_error(),
+        }
+    }
 }
 
 impl fmt::Display for DirectoryResponseError {
@@ -88,7 +101,7 @@ impl error::Error for DirectoryResponseError {
     }
 }
 
-pub fn process_get_res(
+pub(crate) fn process_get_res(
     res: &[u8],
     ohttp_context: ohttp::ClientResponse,
 ) -> Result<Option<Vec<u8>>, DirectoryResponseError> {
@@ -100,7 +113,7 @@ pub fn process_get_res(
     }
 }
 
-pub fn process_post_res(
+pub(crate) fn process_post_res(
     res: &[u8],
     ohttp_context: ohttp::ClientResponse,
 ) -> Result<(), DirectoryResponseError> {
@@ -117,14 +130,14 @@ fn process_ohttp_res(
 ) -> Result<http::Response<Vec<u8>>, DirectoryResponseError> {
     let response_array: &[u8; crate::directory::ENCAPSULATED_MESSAGE_BYTES] =
         res.try_into().map_err(|_| DirectoryResponseError::InvalidSize(res.len()))?;
-    log::trace!("decapsulating directory response");
+    tracing::trace!("decapsulating directory response");
     let res = ohttp_decapsulate(ohttp_context, response_array)
         .map_err(DirectoryResponseError::OhttpDecapsulation)?;
     Ok(res)
 }
 
 /// decapsulate ohttp, bhttp response and return http response body and status code
-pub fn ohttp_decapsulate(
+pub(crate) fn ohttp_decapsulate(
     res_ctx: ohttp::ClientResponse,
     ohttp_body: &[u8; ENCAPSULATED_MESSAGE_BYTES],
 ) -> Result<http::Response<Vec<u8>>, OhttpEncapsulationError> {
@@ -136,7 +149,11 @@ pub fn ohttp_decapsulate(
         builder = builder.header(field.name(), field.value());
     }
     builder
-        .status(m.control().status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR.into()))
+        .status({
+            let code = m.control().status().ok_or(bhttp::Error::InvalidStatus)?;
+
+            http::StatusCode::from_u16(code.code()).map_err(|_| bhttp::Error::InvalidStatus)?
+        })
         .body(m.content().to_vec())
         .map_err(OhttpEncapsulationError::Http)
 }
@@ -147,7 +164,7 @@ pub enum OhttpEncapsulationError {
     Http(http::Error),
     Ohttp(ohttp::Error),
     Bhttp(bhttp::Error),
-    ParseUrl(url::ParseError),
+    ParseUrl(crate::core::UrlParseError),
 }
 
 impl From<http::Error> for OhttpEncapsulationError {
@@ -162,8 +179,8 @@ impl From<bhttp::Error> for OhttpEncapsulationError {
     fn from(value: bhttp::Error) -> Self { Self::Bhttp(value) }
 }
 
-impl From<url::ParseError> for OhttpEncapsulationError {
-    fn from(value: url::ParseError) -> Self { Self::ParseUrl(value) }
+impl From<crate::core::UrlParseError> for OhttpEncapsulationError {
+    fn from(value: crate::core::UrlParseError) -> Self { Self::ParseUrl(value) }
 }
 
 impl fmt::Display for OhttpEncapsulationError {
@@ -200,6 +217,22 @@ impl OhttpKeys {
     pub fn decode(bytes: &[u8]) -> Result<Self, ohttp::Error> {
         ohttp::KeyConfig::decode(bytes).map(Self)
     }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ohttp::Error> {
+        let bytes = self.encode()?;
+
+        let key_id = bytes[0];
+        let uncompressed_pubkey = &bytes[3..68];
+
+        let compressed_pubkey = bitcoin::secp256k1::PublicKey::from_slice(uncompressed_pubkey)
+            .expect("serialization of public key should be deserializable without error")
+            .serialize();
+
+        let mut buf = vec![key_id];
+        buf.extend_from_slice(&compressed_pubkey);
+
+        Ok(buf)
+    }
 }
 
 const KEM_ID: &[u8] = b"\x00\x16"; // DHKEM(secp256k1, HKDF-SHA256)
@@ -208,17 +241,10 @@ const SYMMETRIC_KDF_AEAD: &[u8] = b"\x00\x01\x00\x03"; // KDF(HKDF-SHA256), AEAD
 
 impl fmt::Display for OhttpKeys {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let bytes = self.encode().map_err(|_| fmt::Error)?;
-        let key_id = bytes[0];
-        let pubkey = &bytes[3..68];
+        let buf = self.to_bytes().map_err(|_| fmt::Error)?;
 
-        let compressed_pubkey =
-            bitcoin::secp256k1::PublicKey::from_slice(pubkey).map_err(|_| fmt::Error)?.serialize();
-
-        let mut buf = vec![key_id];
-        buf.extend_from_slice(&compressed_pubkey);
-
-        let oh_hrp: bech32::Hrp = bech32::Hrp::parse("OH").unwrap();
+        let oh_hrp: bech32::Hrp =
+            bech32::Hrp::parse("OH").expect("parsing a valid HRP constant should never fail");
 
         crate::bech32::nochecksum::encode_to_fmt(f, oh_hrp, &buf).map_err(|e| match e {
             EncodeError::Fmt(e) => e,
@@ -231,8 +257,11 @@ impl TryFrom<&[u8]> for OhttpKeys {
     type Error = ParseOhttpKeysError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let key_id = *bytes.first().ok_or(ParseOhttpKeysError::InvalidFormat)?;
-        let compressed_pk = bytes.get(1..34).ok_or(ParseOhttpKeysError::InvalidFormat)?;
+        let buf: [u8; 34] =
+            bytes.try_into().map_err(|_| ParseOhttpKeysError::IncorrectLength(bytes.len()))?;
+
+        let key_id = buf[0];
+        let compressed_pk = &buf[1..];
 
         let pubkey = bitcoin::secp256k1::PublicKey::from_slice(compressed_pk)
             .map_err(|_| ParseOhttpKeysError::InvalidPublicKey)?;
@@ -247,17 +276,18 @@ impl TryFrom<&[u8]> for OhttpKeys {
     }
 }
 
+#[cfg(test)]
 impl std::str::FromStr for OhttpKeys {
     type Err = ParseOhttpKeysError;
 
     /// Parses a base64URL-encoded string into OhttpKeys.
     /// The string format is: key_id || compressed_public_key
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // TODO extract to utility function
-        let oh_hrp: bech32::Hrp = bech32::Hrp::parse("OH").unwrap();
+        let oh_hrp: bech32::Hrp =
+            bech32::Hrp::parse("OH").expect("parsing a valid HRP constant should never fail");
 
         let (hrp, bytes) =
-            crate::bech32::nochecksum::decode(s).map_err(ParseOhttpKeysError::DecodeBech32)?;
+            crate::bech32::nochecksum::decode(s).map_err(|_| ParseOhttpKeysError::InvalidFormat)?;
 
         if hrp != oh_hrp {
             return Err(ParseOhttpKeysError::InvalidFormat);
@@ -311,50 +341,69 @@ impl serde::Serialize for OhttpKeys {
 
 #[derive(Debug)]
 pub enum ParseOhttpKeysError {
-    InvalidFormat,
+    IncorrectLength(usize),
     InvalidPublicKey,
-    DecodeBech32(bech32::primitives::decode::CheckedHrpstringError),
     DecodeKeyConfig(ohttp::Error),
+    #[cfg(test)]
+    InvalidFormat,
 }
 
 impl std::fmt::Display for ParseOhttpKeysError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ParseOhttpKeysError::*;
         match self {
-            ParseOhttpKeysError::InvalidFormat => write!(f, "Invalid format"),
-            ParseOhttpKeysError::InvalidPublicKey => write!(f, "Invalid public key"),
-            ParseOhttpKeysError::DecodeBech32(e) => write!(f, "Failed to decode bech32: {e}"),
-            ParseOhttpKeysError::DecodeKeyConfig(e) => write!(f, "Failed to decode KeyConfig: {e}"),
+            IncorrectLength(l) => write!(f, "Invalid length, got {l} expected 34"),
+            InvalidPublicKey => write!(f, "Invalid public key"),
+            DecodeKeyConfig(e) => write!(f, "Failed to decode KeyConfig: {e}"),
+            #[cfg(test)]
+            InvalidFormat => write!(f, "Invalid format"),
         }
     }
 }
 
 impl std::error::Error for ParseOhttpKeysError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use ParseOhttpKeysError::*;
         match self {
-            ParseOhttpKeysError::DecodeBech32(e) => Some(e),
-            ParseOhttpKeysError::DecodeKeyConfig(e) => Some(e),
-            ParseOhttpKeysError::InvalidFormat | ParseOhttpKeysError::InvalidPublicKey => None,
+            DecodeKeyConfig(e) => Some(e),
+            IncorrectLength(_) | InvalidPublicKey => None,
+            #[cfg(test)]
+            InvalidFormat => None,
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use payjoin_test_utils::{KEM, KEY_ID, SYMMETRIC};
+
     use super::*;
 
     #[test]
     fn test_ohttp_keys_roundtrip() {
-        use std::str::FromStr;
-
-        use ohttp::hpke::{Aead, Kdf, Kem};
-        use ohttp::{KeyId, SymmetricSuite};
-        const KEY_ID: KeyId = 1;
-        const KEM: Kem = Kem::K256Sha256;
-        const SYMMETRIC: &[SymmetricSuite] =
-            &[ohttp::SymmetricSuite::new(Kdf::HkdfSha256, Aead::ChaCha20Poly1305)];
         let keys = OhttpKeys(ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).unwrap());
-        let serialized = &keys.to_string();
-        let deserialized = OhttpKeys::from_str(serialized).unwrap();
-        assert_eq!(keys.encode().unwrap(), deserialized.encode().unwrap());
+        let serialized = keys.to_bytes().unwrap();
+        let deserialized = OhttpKeys::try_from(&serialized[..]).unwrap();
+        assert!(keys.eq(&deserialized));
+    }
+
+    #[test]
+    fn test_ohttp_keys_equality() {
+        use ohttp::KeyId;
+        const KEY_ID_ONE: KeyId = 1;
+        let keys_one =
+            OhttpKeys(ohttp::KeyConfig::new(KEY_ID_ONE, KEM, Vec::from(SYMMETRIC)).unwrap());
+        let serialized_one = &keys_one.to_bytes().unwrap();
+        let deserialized_one = OhttpKeys::try_from(&serialized_one[..]).unwrap();
+
+        const KEY_ID_TWO: KeyId = 2;
+        let keys_two =
+            OhttpKeys(ohttp::KeyConfig::new(KEY_ID_TWO, KEM, Vec::from(SYMMETRIC)).unwrap());
+        let serialized_two = &keys_two.to_bytes().unwrap();
+        let deserialized_two = OhttpKeys::try_from(&serialized_two[..]).unwrap();
+        assert!(keys_one.eq(&deserialized_one));
+        assert!(keys_two.eq(&deserialized_two));
+        assert!(!keys_one.eq(&deserialized_two));
+        assert!(!keys_two.eq(&deserialized_one));
     }
 }

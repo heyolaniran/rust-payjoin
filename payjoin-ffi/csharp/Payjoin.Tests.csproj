@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Required by UniFFI-generated interop code (pointer usage in payjoin.cs); disabling /unsafe fails with CS0227. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+  </ItemGroup>
+
+  <!-- Include native library - copied to output directory for testing -->
+  <Target Name="CopyNativeLibraries" AfterTargets="Build">
+    <Copy SourceFiles="lib/libpayjoin_ffi.so" DestinationFolder="$(TargetDir)" Condition="Exists('lib/libpayjoin_ffi.so')" />
+    <Copy SourceFiles="lib/libpayjoin_ffi.dylib" DestinationFolder="$(TargetDir)" Condition="Exists('lib/libpayjoin_ffi.dylib')" />
+    <Copy SourceFiles="lib/payjoin_ffi.dll" DestinationFolder="$(TargetDir)" Condition="Exists('lib/payjoin_ffi.dll')" />
+  </Target>
+
+</Project>

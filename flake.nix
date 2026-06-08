@@ -2,47 +2,135 @@
   description = "rust-payjoin";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    nix2container = {
+      url = "github:nlewo/nix2container";
+    };
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    rust-overlay,
-    crane,
-  }:
-    flake-utils.lib.eachDefaultSystem (
-      system: let
+  outputs =
+    {
+      self,
+      nixpkgs,
+      nixpkgs-unstable,
+      flake-utils,
+      rust-overlay,
+      crane,
+      treefmt-nix,
+      nix2container,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+    }:
+    {
+      nixosModules.payjoin-mailroom = import ./nix/modules/payjoin-mailroom.nix self;
+    }
+    // flake-utils.lib.eachDefaultSystem (
+      system:
+      let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [rust-overlay.overlays.default];
+          overlays = [
+            rust-overlay.overlays.default
+            (final: prev: {
+              dart = nixpkgs-unstable.legacyPackages.${system}.dart;
+              rustToolchains = {
+                msrv = prev.rust-bin.stable.${msrv-version}.default;
+                stable = prev.rust-bin.stable.latest.default;
+                nightly = prev.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+              };
+            })
+          ];
         };
 
-        msrv = "1.63.0";
-        rustVersions = with pkgs.rust-bin;
-          builtins.mapAttrs (_name: rust-bin:
-            rust-bin.override {
-              extensions = ["rust-src" "rustfmt" "llvm-tools-preview"];
-            })
-          {
-            msrv = stable.${msrv}.default;
-            stable = stable.latest.default;
-            nightly = nightly.latest.default;
-          };
+        msrv-version = "1.85.0";
+
+        nginxWithStream = pkgs.nginxMainline.overrideAttrs (oldAttrs: {
+          configureFlags = oldAttrs.configureFlags ++ [
+            "--with-stream"
+            "--with-stream_ssl_module"
+            "--error-log-path=/dev/null"
+          ];
+        });
+        rustVersions =
+          with pkgs.rust-bin;
+          builtins.mapAttrs
+            (
+              _name: rust-bin:
+              rust-bin.override {
+                extensions = [
+                  "rust-src"
+                  "rustfmt"
+                  "llvm-tools-preview"
+                ];
+              }
+            )
+            {
+              msrv = stable.${msrv-version}.default;
+              stable = stable.latest.default;
+              nightly = fromRustupToolchainFile ./rust-toolchain.toml;
+            };
 
         # Use crane to define nix packages for the workspace crate
         # based on https://crane.dev/examples/quick-start-workspace.html
         # default to nightly rust toolchain in crane, mainly due to rustfmt difference
-        craneLibVersions = builtins.mapAttrs (name: rust-bin: (crane.mkLib pkgs).overrideToolchain (_: rust-bin)) rustVersions;
-        craneLib = craneLibVersions.nightly;
-        src = craneLib.cleanCargoSource ./.;
+        craneLibVersions = builtins.mapAttrs (
+          name: rust-bin: (crane.mkLib pkgs).overrideToolchain (_: rust-bin)
+        ) rustVersions;
+
+        src = nixpkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            (builtins.match ".*nginx.conf.template$" path != null)
+            || (builtins.match ".*\\.mmdb$" path != null)
+            || (builtins.match ".*\\.html$" path != null)
+            || (craneLibVersions.msrv.filterCargoSources path type);
+          name = "source";
+        };
+        cargoLock = rec {
+          default = recent; # see also #454
+          recent = ./Cargo-recent.lock;
+          minimal = ./Cargo-minimal.lock;
+          msrv = minimal;
+          stable = default;
+          nightly = recent;
+        };
+
+        vendoredDeps = builtins.mapAttrs (
+          name: _:
+          craneLibVersions.stable.vendorCargoDeps {
+            cargoLock = cargoLock.${name};
+            inherit src;
+          }
+        ) craneLibVersions;
+
         commonArgs = {
           inherit src;
           strictDeps = true;
@@ -53,135 +141,449 @@
           pname = "workspace";
           version = "no-version";
 
-          # default to recent dependency versions
-          # TODO add overrides for minimal lockfile, once #454 is resolved
-          cargoLock = ./Cargo-recent.lock;
-
           # tell bitcoind crate not to try to download during build
           BITCOIND_SKIP_DOWNLOAD = 1;
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        individualCrateArgs =
+        # Per-toolchain common args that include pre-vendored deps
+        commonArgsFor =
+          name:
           commonArgs
           // {
-            inherit cargoArtifacts;
-            doCheck = false; # skip testing, since that's done in flake check
+            cargoVendorDir = vendoredDeps.${name};
           };
 
-        fileSetForCrate = subdir:
+        # use nix-ci profile for fast checks
+        ciArgsFor =
+          name:
+          commonArgsFor name
+          // {
+            CARGO_PROFILE = "nix-ci";
+          };
+
+        cargoArtifacts = builtins.mapAttrs (
+          name: craneLib:
+          craneLib.buildDepsOnly (
+            commonArgsFor name
+            // {
+              name = "workspace-deps-${name}";
+              cargoLock = cargoLock.${name};
+            }
+          )
+        ) craneLibVersions;
+        # use nix-ci profile for cargo artifacts
+        cargoArtifactsCi = builtins.mapAttrs (
+          name: craneLib:
+          craneLib.buildDepsOnly (
+            ciArgsFor name
+            // {
+              name = "workspace-deps-ci-${name}";
+              cargoLock = cargoLock.${name};
+            }
+          )
+        ) craneLibVersions;
+
+        treefmtEval = treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
+
+        fileSetForCrate =
+          subdir:
           pkgs.lib.fileset.toSource {
             root = ./.;
             fileset = pkgs.lib.fileset.unions [
               ./Cargo.toml
-              (craneLib.fileset.commonCargoSources subdir)
+              (craneLibVersions.msrv.fileset.commonCargoSources subdir)
             ];
           };
 
         packages =
-          builtins.mapAttrs (
-            name: extraArgs:
-              craneLib.buildPackage (individualCrateArgs
-                // craneLib.crateNameFromCargoToml {cargoToml = builtins.toPath "${./.}/${name}/Cargo.toml";}
+          builtins.mapAttrs
+            (
+              name: extraArgs:
+              # build packages with MSRV toolchain by default, since the builds are
+              # mostly for testing purposes
+              craneLibVersions.msrv.buildPackage (
+                commonArgsFor "msrv"
+                // craneLibVersions.msrv.crateNameFromCargoToml {
+                  cargoToml = builtins.toPath "${./.}/${name}/Cargo.toml";
+                }
                 // {
+                  cargoLock = cargoLock.msrv;
+                  cargoArtifacts = cargoArtifacts.msrv;
+                  doCheck = false; # skip testing, since that's done in a separate flake check
                   cargoExtraArgs = "--locked -p ${name} ${extraArgs}";
                   inherit src;
-                })
-          ) {
-            "payjoin" = "--features v2";
-            "payjoin-cli" = "--features v1,v2";
-            "payjoin-directory" = "";
+                }
+              )
+            )
+            {
+              "payjoin" = "--features v2";
+              "payjoin-cli" = "--features v1,v2";
+              "payjoin-mailroom" = "--features access-control,acme,telemetry";
+            };
+
+        # nix2container for building OCI/Docker images
+        nix2containerPkgs = nix2container.packages.${system};
+
+        # Helper to create a container image for a package
+        mkContainerImage =
+          name: pkg: tag:
+          let
+            releasePkg = pkg.overrideAttrs (final: prev: { CARGO_PROFILE = "release"; });
+          in
+          nix2containerPkgs.nix2container.buildImage {
+            inherit tag;
+            name = "docker.io/payjoin/${name}";
+            copyToRoot = pkgs.buildEnv {
+              name = "root";
+              paths = [ releasePkg ];
+              pathsToLink = [ "/bin" ];
+            };
+            config = {
+              entrypoint = [ (pkgs.lib.getExe' releasePkg name) ];
+            };
+            maxLayers = 50;
           };
 
-        devShells = builtins.mapAttrs (_name: craneLib:
-          craneLib.devShell {
-            packages = with pkgs; [
-              cargo-edit
-              cargo-nextest
-              cargo-watch
-              rust-analyzer
-            ] ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
-              cargo-llvm-cov
-            ];
-          })
-        craneLibVersions;
+        containerImages =
+          let
+            envTag = builtins.getEnv "IMAGE_TAG";
+            tag =
+              if envTag == "master" then
+                self.shortRev
+              else if envTag != "" then
+                envTag
+              else
+                self.shortRev or "dirty";
+          in
+          {
+            "payjoin-mailroom-image" = mkContainerImage "payjoin-mailroom" packages.payjoin-mailroom tag;
+          };
 
-        simpleCheck = args:
-          pkgs.stdenvNoCC.mkDerivation ({
+        dotnetSdk = pkgs.dotnetCorePackages.sdk_10_0;
+
+        devShells = builtins.mapAttrs (
+          _name: craneLib:
+          craneLib.devShell {
+            packages =
+              with pkgs;
+              [
+                cargo-edit
+                cargo-nextest
+                cargo-watch
+                rust-analyzer
+                cargo-fuzz
+                bzip2 # needed for some machines to have access to libzip at runtime
+                codespell
+              ]
+              ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+                cargo-llvm-cov
+              ];
+            BITCOIND_EXE = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+            BITCOIND_SKIP_DOWNLOAD = 1;
+          }
+        ) craneLibVersions;
+
+        # uv2nix: load the Python workspace from payjoin-ffi/python/uv.lock
+        pythonWorkspace = uv2nix.lib.workspace.loadWorkspace {
+          workspaceRoot = ./payjoin-ffi/python;
+        };
+
+        pythonOverlay = pythonWorkspace.mkPyprojectOverlay {
+          sourcePreference = "wheel";
+        };
+
+        pythonSet =
+          (pkgs.callPackage pyproject-nix.build.packages {
+            python = pkgs.python3;
+          }).overrideScope
+            (
+              nixpkgs.lib.composeManyExtensions [
+                pyproject-build-systems.overlays.wheel
+                pythonOverlay
+              ]
+            );
+
+        # Build a virtualenv with dependency groups from uv.lock, excluding the payjoin package, which is built separately
+        pythonVenv = pythonSet.mkVirtualEnv "payjoin-python-dev-env" (
+          builtins.removeAttrs pythonWorkspace.deps.all [ "payjoin" ]
+        );
+
+        # Rust toolchain for the javascript dev shell: msrv pinned to match
+        # payjoin-ffi/javascript build requirements, with wasm32 target added
+        # so cargo can build per-arch artifacts under nix (rustup target add
+        # is a no-op against a nix-provided toolchain).
+        jsRustToolchain = pkgs.rust-bin.stable.${msrv-version}.default.override {
+          extensions = [
+            "rust-src"
+            "rustfmt"
+            "llvm-tools-preview"
+          ];
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+
+        javascriptDevShell = pkgs.mkShell {
+          name = "javascript-dev";
+          packages = with pkgs; [
+            jsRustToolchain
+            nodejs
+            # Version must match the wasm-bindgen crate locked in
+            # payjoin-ffi/javascript/rust_modules/wasm/Cargo.lock.
+            wasm-bindgen-cli_0_2_108
+            # secp256k1-sys build.rs invokes cc-rs for the wasm32-unknown-unknown
+            # target; cc-rs defaults to clang for wasm and needs llvm-ar.
+            llvmPackages.clang-unwrapped
+            llvmPackages.bintools-unwrapped
+            lld
+            bzip2 # needed for some machines to have access to libzip at runtime
+          ];
+          CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
+        };
+
+        dartDevShell = pkgs.mkShell {
+          name = "dart-dev";
+          packages =
+            with pkgs;
+            [
+              rustVersions.msrv
+              dart
+              bzip2
+            ]
+            ++ lib.optionals pkgs.stdenv.isLinux [
+              pkg-config
+              openssl
+              clang
+            ];
+          BITCOIND_EXE = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+          BITCOIND_SKIP_DOWNLOAD = 1;
+        };
+
+        csharpDevShell = pkgs.mkShell {
+          name = "csharp-dev";
+          packages =
+            with pkgs;
+            [
+              rustVersions.msrv
+              dotnetSdk
+              bzip2
+            ]
+            ++ lib.optionals pkgs.stdenv.isLinux [
+              pkg-config
+              openssl
+              clang
+            ];
+          DOTNET_ROOT = "${dotnetSdk}/share/dotnet";
+          DOTNET_CLI_TELEMETRY_OPTOUT = "1";
+          BITCOIND_EXE = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+          BITCOIND_SKIP_DOWNLOAD = 1;
+        };
+
+        # Rust toolchain for the python dev shell: msrv pinned to match
+        # payjoin-ffi/python build requirements, with per-arch targets added
+        # so cargo can build artifacts under nix for payjoin-ffi/python/scripts/generate_bindings.sh
+        # (rustup target add is a no-op against a nix-provided toolchain).
+        pythonRustToolchain = pkgs.rust-bin.stable.${msrv-version}.default.override {
+          extensions = [
+            "rust-src"
+            "rustfmt"
+            "llvm-tools-preview"
+          ];
+          targets =
+            pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              "aarch64-apple-darwin"
+              "x86_64-apple-darwin"
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              "x86_64-unknown-linux-gnu"
+            ];
+        };
+
+        pythonDevShell = pkgs.mkShell {
+          name = "python-dev";
+          packages =
+            with pkgs;
+            [
+              pythonVenv
+              uv
+              pythonRustToolchain
+              bzip2 # needed for some machines to have access to libzip at runtime
+            ]
+            ++ lib.optionals pkgs.stdenv.isLinux [
+              pkg-config
+              openssl
+              clang
+            ];
+
+          env = {
+            # Prevent uv from downloading Python or managing the venv itself, nix provides both;
+            UV_NO_SYNC = "1";
+            UV_PYTHON_DOWNLOADS = "never";
+          };
+          BITCOIND_EXE = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+          BITCOIND_SKIP_DOWNLOAD = 1;
+
+          shellHook = ''
+            # to avoid host/global Python path leaking into the Nix env
+            unset PYTHONPATH
+          '';
+        };
+
+        simpleCheck =
+          args:
+          pkgs.stdenvNoCC.mkDerivation (
+            {
               doCheck = true;
               dontFixup = true;
               installPhase = "mkdir $out";
             }
-            // args);
-      in {
-        packages = packages;
-        devShells = devShells // {default = devShells.nightly;};
-        formatter = pkgs.alejandra;
-        checks =
+            // args
+          );
+
+        dummySrc = pkgs.runCommand "dummy src" { } "mkdir $out";
+        checkSuite =
+          name: buildInputs:
+          simpleCheck {
+            inherit name;
+            inherit buildInputs;
+            src = dummySrc;
+          };
+      in
+      {
+        packages =
           packages
+          // containerImages
           // {
-            payjoin-workspace-nextest = craneLib.cargoNextest (commonArgs
-              // {
-                inherit cargoArtifacts;
-                partitions = 1;
-                partitionType = "count";
-                # TODO also run integration tests
-                # this needs --all-features to enable io,_danger_local_https features
-                # unfortunately this can't yet work because running docker inside the nix sandbox is not possible,
-                # which precludes use of the redis test container
-                # cargoExtraArgs = "--locked --all-features";
-                # buildInputs = [ pkgs.bitcoind ]; # not verified to work
-              });
+            nginx-with-stream = nginxWithStream;
+          };
+        devShells = devShells // {
+          default = devShells.nightly;
+          python = pythonDevShell;
+          javascript = javascriptDevShell;
+          csharp = csharpDevShell;
+          dart = dartDevShell;
+        };
+        formatter = treefmtEval.config.build.wrapper;
+        checks =
+          (pkgs.lib.mapAttrs' (
+            name: craneLib:
+            (pkgs.lib.nameValuePair "payjoin-workspace-nextest-${name}" (
+              craneLib.cargoNextest (
+                ciArgsFor name
+                // {
+                  name = "payjoin-workspace-nextest-${name}";
+                  cargoLock = cargoLock.${name};
+                  cargoArtifacts = cargoArtifactsCi.${name};
+                  partitions = 1;
+                  partitionType = "count";
+                  cargoExtraArgs = "--locked --workspace --all-features --exclude payjoin-fuzz";
+                  BITCOIND_EXE = nixpkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+                  NGINX_EXE = nixpkgs.lib.getExe' nginxWithStream "nginx";
+                  nativeBuildInputs = [ nginxWithStream ];
+                  doInstallCargoArtifacts = false;
+                }
+              )
+            ))
+          ) craneLibVersions
 
-            payjoin-workspace-nextest-msrv = craneLibVersions.msrv.cargoNextest (commonArgs
+          )
+          // {
+            payjoin-workspace-machete = craneLibVersions.nightly.mkCargoDerivation (
+              ciArgsFor "nightly"
               // {
-                cargoArtifacts = craneLibVersions.msrv.buildDepsOnly commonArgs;
-                partitions = 1;
-                partitionType = "count";
-              });
+                pname = "payjoin-workspace-machete";
+                cargoLock = cargoLock.nightly;
+                cargoArtifacts = cargoArtifactsCi.nightly;
+                nativeBuildInputs = [ pkgs.cargo-machete ];
+                buildPhaseCargoCommand = "";
+                checkPhaseCargoCommand = "cargo machete";
+                doCheck = true;
+              }
+            );
 
-            payjoin-workspace-clippy = craneLib.cargoClippy (commonArgs
+            payjoin-workspace-clippy = craneLibVersions.nightly.cargoClippy (
+              ciArgsFor "nightly"
               // {
-                inherit cargoArtifacts;
+                cargoLock = cargoLock.nightly;
+                cargoArtifacts = cargoArtifactsCi.nightly;
                 cargoClippyExtraArgs = "--all-targets --all-features --keep-going -- --deny warnings";
-              });
+              }
+            );
 
-            payjoin-workspace-doc = craneLib.cargoDoc (commonArgs
+            payjoin-workspace-doc = craneLibVersions.nightly.cargoDoc (
+              ciArgsFor "nightly"
               // {
-                inherit cargoArtifacts;
-              });
+                cargoLock = cargoLock.nightly;
+                cargoArtifacts = cargoArtifactsCi.nightly;
+              }
+            );
 
-            payjoin-workspace-fmt = craneLib.cargoFmt (commonArgs
+            payjoin-workspace-fmt = craneLibVersions.nightly.cargoFmt (
+              ciArgsFor "nightly"
               // {
                 inherit src;
-              });
+                # cargoLock = cargoLock.nightly;
+              }
+            );
 
-            nix-fmt-check = simpleCheck {
-              name = "nix-fmt-check";
-              src = pkgs.lib.sources.sourceFilesBySuffices ./. [".nix"];
-              nativeBuildInputs = [pkgs.alejandra];
-              checkPhase = ''
-                alejandra -c .
-              '';
-            };
+            formatting = treefmtEval.config.build.check self;
 
-            shfmt = simpleCheck rec {
-              name = "shell-checks";
-              src = pkgs.lib.sources.sourceFilesBySuffices ./. [".sh"];
-              nativeBuildInputs = [pkgs.shfmt];
-              checkPhase = ''
-                shfmt -d -s -i 4 -ci ${src}
-              '';
-            };
+            quick = checkSuite "quick" (
+              with self.outputs.checks.${system};
+              [
+                formatting
+              ]
+            );
 
-            shellcheck = simpleCheck rec {
-              name = "shell-checks";
-              src = pkgs.lib.sources.sourceFilesBySuffices ./. [".sh"];
-              nativeBuildInputs = [pkgs.shellcheck];
-              checkPhase = ''
-                shellcheck -x ${src}
-              '';
-            };
+            slow = checkSuite "slow" (
+              with self.outputs.checks.${system};
+              [
+                nightly
+                stable
+                msrv
+              ]
+            );
+
+            nightly = checkSuite "nightly" (
+              with self.outputs.checks.${system};
+              [
+                payjoin-workspace-nextest-nightly
+              ]
+            );
+
+            stable = checkSuite "stable" (
+              with self.outputs.checks.${system};
+              [
+                payjoin-workspace-nextest-stable
+              ]
+            );
+
+            msrv = checkSuite "msrv" (
+              with self.outputs.checks.${system};
+              [
+                payjoin-workspace-nextest-msrv
+              ]
+              ++ pkgs.lib.attrValues (
+                builtins.mapAttrs (
+                  _name: pkg:
+                  pkg.overrideAttrs (
+                    final: prev: {
+                      CARGO_PROFILE = "nix-ci";
+                      cargoArtifacts = cargoArtifactsCi.msrv;
+                    }
+                  )
+                ) packages
+              )
+            );
+
+            maintenance = checkSuite "maintenance" (
+              with self.outputs.checks.${system};
+              [
+                payjoin-workspace-machete
+                payjoin-workspace-clippy
+                payjoin-workspace-doc
+                formatting
+              ]
+            );
           };
       }
     );

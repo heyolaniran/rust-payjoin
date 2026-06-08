@@ -1,0 +1,83 @@
+name: "Build and publish Docker image"
+
+on:
+  pull_request:
+    paths:
+      - payjoin-mailroom/**
+  push:
+    tags:
+      - payjoin-mailroom-**
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: "Build and publish Docker image"
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.PAYJOIN_DOCKER_RW }}
+
+      - name: Build and release image
+        env:
+          IMAGE_TAG: ${{ github.ref_name }}
+        # --impure is needed to pass env variables into the flake.
+        # This breaks deterministic builds but allows us to identify
+        # the image with the release tag name.
+        run: nix run --impure .#packages.x86_64-linux.payjoin-mailroom-image.copyToRegistry
+
+  build-pr:
+    name: "Build and upload image artifact"
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Wait for other workflows
+        uses: lewagon/wait-on-check-action@v1.5.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          running-workflow-name: "Build and upload image artifact"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build and save image artifact
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+
+          nix build .#packages.x86_64-linux.payjoin-mailroom-image.copyToDockerDaemon
+          result/bin/copy-to-docker-daemon
+
+          docker save docker.io/payjoin/payjoin-mailroom:${TAG} -o payjoin-mailroom-${TAG}.tar
+
+          echo "Image saved: payjoin-mailroom-${TAG}.tar"
+          ls -lh payjoin-mailroom-${TAG}.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: payjoin-mailroom-image-${{ github.sha }}
+          path: payjoin-mailroom-*.tar
+          retention-days: 7

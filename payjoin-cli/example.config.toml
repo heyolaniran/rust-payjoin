@@ -6,7 +6,7 @@
 # --------------
 
 # The path to the database file
-db_path = "payjoin.sled"
+db_path = "payjoin.sqlite"
 
 # The maximum fee rate that the receiver is willing to pay (in sat/vB)
 max_fee_rate = 2.0
@@ -49,7 +49,7 @@ rpcpassword = "password"
 # Version 2 Configuration
 # [v2]
 # pj_directory = "https://payjo.in"
-# ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://ohttp.achow101.com", "https://example.com"]
+# ohttp_relays = ["https://pj.benalleng.com", "https://pj.bobspacebkk.com", "https://payjoin.achow101.com", "https://example.com"]
 # # Optional: The HPKE keys which need to be fetched ahead of time from the pj_endpoint
 # # for the payjoin packets to be encrypted.
 # # These can now be fetched and no longer need to be configured.

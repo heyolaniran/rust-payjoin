@@ -19,7 +19,8 @@ pub const ENCAPSULATED_MESSAGE_BYTES: usize = 8192;
 ///
 /// Note: This implementation assumes ephemeral public keys with sufficient entropy. The short length
 /// is an intentional tradeoff that provides adequate practical uniqueness while reducing DoS surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "_core", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShortId(pub [u8; 8]);
 
 impl ShortId {
@@ -29,7 +30,8 @@ impl ShortId {
 
 impl std::fmt::Display for ShortId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let id_hrp = bitcoin::bech32::Hrp::parse("ID").unwrap();
+        let id_hrp = bitcoin::bech32::Hrp::parse("ID")
+            .expect("parsing a valid HRP constant should never fail");
         f.write_str(
             crate::bech32::nochecksum::encode(id_hrp, &self.0)
                 .expect("bech32 encoding of short ID must succeed")
@@ -67,5 +69,17 @@ impl std::str::FromStr for ShortId {
         let (_, bytes) = crate::bech32::nochecksum::decode(&("ID1".to_string() + s))
             .map_err(ShortIdError::DecodeBech32)?;
         (&bytes[..]).try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShortId;
+
+    #[test]
+    fn short_id_conversion() {
+        let short_id = ShortId([0; 8]);
+        assert_eq!(short_id.as_bytes(), short_id.0);
+        assert_eq!(short_id.as_slice(), short_id.0);
     }
 }
